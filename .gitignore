@@ -1,0 +1,13 @@
+# IRS bulk downloads (~380 MB), re-fetched automatically
+irs_data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Botasaurus run artifacts
+error_logs/
+profiles/
+cache/
