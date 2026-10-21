@@ -226,7 +226,10 @@ def extract(result, soup, url):
                 add(result, 'org_type', 'Government agency', url, 'self_description_text', 80)
             # Keep the service-area statement intact rather than guessing borders.
             area = re.search(r'[^.!?]*(?:\bwe serve\b|\bour service area\b|\bserving (?:the )?(?:residents|people|families|communities|counties)\b)[^.!?]*[.!?]?', block, re.I)
-            if area:
+            # "We serve 500 families a year" is not a service area; require a place.
+            if area and len(area[0]) <= 250 and re.search(
+                    r'\b(?:count(?:y|ies)|statewide|state of|south carolina|SC|upstate|midlands|low ?country|pee dee|region)\b',
+                    area[0], re.I):
                 add(result, 'area_served', area[0].strip(), url, 'service_area_statement', 80)
             if re.search(rf'\b{subject}\s+(?:is|are|has|have)\s+(?:now |permanently )?(?:closed|ceased operations|no longer operating)\b', block, re.I):
                 add(result, 'is_active', 'No', url, 'explicit_operating_statement', 100)
@@ -259,24 +262,50 @@ def profile_pages(soup, url, root):
         label = text(anchor.get_text(' ', strip=True)).lower()
         if urlparse(value).scheme not in ('http', 'https') or host(value) != host(root) or value == url:
             continue
+        if is_listing_page(value, label):
+            continue
         if any(word in f'{urlparse(value).path.lower()} {label}' for word in PROFILE_WORDS):
             if value not in pages and not re.search(r'\.(pdf|jpg|png|zip)$', urlparse(value).path, re.I):
                 pages.append(value)
     return pages
 
 
-def finalize(result):
+# Rule-based guesses (priority below this) only fill fields the table left blank.
+WEAK_PRIORITY = 50
+# Sites word their own description several ways, so that is not a conflict.
+CONFLICT_FIELDS = tuple(field for field in FIELDS if field != 'org_description')
+
+
+def comparable(field, value):
+    if field == 'website_url':
+        return f"{host(value)}{urlparse(value).path.rstrip('/').lower()}"
+    words = re.findall(r'[a-z0-9]+', re.sub(r"['’]", '', value.casefold()))
+    return ' '.join(word for word in words if word not in {'inc', 'the', 'of', 'and'})
+
+
+def has_conflict(field, rows):
+    keys = {comparable(field, row['value']) for row in rows} - {''}
+    if field in ('org_name', 'area_served'):
+        # "Beyond Abuse" and "Surviving Child Abuse | Beyond Abuse" agree.
+        keys = {key for key in keys if not any(key != other and f' {key} ' in f' {other} ' for other in keys)}
+    return len(keys) > 1
+
+
+def finalize(result, max_values=None):
     """Promote best profile evidence; keep source values as documented fallbacks."""
     for field in FIELDS:
+        baseline = result['original_fields'][field]
         candidates = result['organization_details'][field]
-        if candidates:
-            chosen = max(candidates, key=lambda row: row['priority'])
+        usable = [row for row in candidates if row['priority'] >= WEAK_PRIORITY or not usable_value(baseline)]
+        if usable:
+            chosen = max(usable, key=lambda row: row['priority'])
             result[field] = chosen['value']
             result['field_sources'][field] = {k: v for k, v in chosen.items() if k != 'priority'}
         else:
+            result[field] = baseline
             result['field_sources'][field] = dict(
-                value=result[field], source_url=None,
-                method='provided_inventory' if result[field] else 'not_found')
+                value=baseline, source_url=None,
+                method='provided_inventory' if baseline else 'not_found')
     # Scraped primary values use exactly the requested flat schema. All others
     # remain available in contacts and original_fields.
     for field, bucket, key in [('org_phone', 'phones', 'raw'),
@@ -287,9 +316,15 @@ def finalize(result):
             result[field] = values[0][key]
             result['field_sources'][field] = dict(values[0])
         else:
+            result[field] = result['original_fields'][field]
             result['field_sources'][field] = dict(value=result[field], source_url=None,
                 method='provided_inventory' if result[field] else 'not_found')
     addresses = result['contacts']['addresses']
+    if not addresses:
+        for field in ('street_address', 'city', 'state', 'zip'):
+            result[field] = result['original_fields'][field]
+            result['field_sources'][field] = dict(value=result[field], source_url=None,
+                method='provided_inventory' if result[field] else 'not_found')
     if addresses:
         best = next((row for row in addresses if row['kind'] == 'physical'), addresses[0])
         raw = best['raw']
@@ -309,10 +344,13 @@ def finalize(result):
     result['extraction']['profile_review_required'] = any(
         row['method'].startswith('inferred') for row in result['field_sources'].values())
     result['extraction']['profile_conflicts'] = [
-        field for field in FIELDS if len({r['value'].casefold()
-        for r in result['organization_details'][field]}) > 1]
+        field for field in CONFLICT_FIELDS if has_conflict(field, result['organization_details'][field])]
     if result['extraction']['profile_conflicts']:
         result['extraction']['profile_review_required'] = True
+    if max_values:
+        for candidates in result['organization_details'].values():
+            candidates.sort(key=lambda row: -row['priority'])
+            del candidates[max_values:]
     if result['data_origin'] == 'live_scrape' and result['extraction']['pages_checked']:
         result['last_checked'] = result['scraped_at'][:10]
         result['field_sources']['last_checked'] = dict(
@@ -499,11 +537,21 @@ def new_result(item: dict[str, Any], data_origin: str) -> dict[str, Any]:
     return result
 
 
-def unique_add(records: list[dict[str, Any]], candidate: dict[str, Any], key: str) -> None:
-    """Append a contact only once, while retaining the first source location."""
+def unique_add(records: list[dict[str, Any]], candidate: dict[str, Any], key: str, count: bool = False) -> None:
+    """Append a contact only once, while retaining the first source location.
+
+    With ``count``, repeat sightings are tallied in ``_seen`` so values shown on
+    every page (usually the footer) rank higher; tidy_contacts removes the tally.
+    """
     comparison = clean_text(candidate[key]).lower()
-    if comparison and not any(clean_text(row[key]).lower() == comparison for row in records):
-        records.append(candidate)
+    if not comparison:
+        return
+    for row in records:
+        if clean_text(row[key]).lower() == comparison:
+            if count:
+                row["_seen"] = row.get("_seen", 1) + 1
+            return
+    records.append(candidate)
 
 
 def split_phone_values(value: str) -> list[str]:
@@ -623,7 +671,7 @@ def same_domain(first: str, second: str) -> bool:
 def clean_address(value: Any) -> str:
     cleaned = clean_text(value)
     cleaned = re.sub(
-        r"^(?:address|location|mailing address|visit us|our office)\s*:?\s*",
+        r"^(?:mailing address|physical address|address|mailing|location|visit us|our office)\s*:?\s*",
         "",
         cleaned,
         flags=re.IGNORECASE,
@@ -710,6 +758,7 @@ def add_address(result: dict[str, Any], value: Any, page_url: str, method: str) 
                 "method": method,
             },
             "raw",
+            count=True,
         )
 
 
@@ -730,6 +779,7 @@ def add_phone(
                 "method": method,
             },
             "raw",
+            count=True,
         )
 
 
@@ -744,6 +794,7 @@ def add_email(result: dict[str, Any], value: Any, page_url: str, method: str) ->
                 "method": method,
             },
             "value",
+            count=True,
         )
 
 
@@ -758,6 +809,7 @@ def add_map_link(result: dict[str, Any], link: Any, page_url: str) -> None:
         result["contacts"]["map_links"],
         {"url": href, "text": link_text(link), "source_url": page_url},
         "url",
+        count=True,
     )
 
     values = [link_text(link)]
@@ -769,6 +821,271 @@ def add_map_link(result: dict[str, Any], link: Any, page_url: str) -> None:
         values.extend(unquote(entry).replace("+", " ") for entry in parse_qs(parsed.query).get(key, []))
     for value in values:
         add_address(result, value, page_url, "map_link")
+
+
+# ---------------------------------------------------------------------------
+# Contact cleanup: validate, merge duplicates, rank, and keep the best few.
+# ---------------------------------------------------------------------------
+
+US_STATES = set(
+    "AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV NH NJ "
+    "NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY DC PR".split()
+)
+# A complete address: street (or PO Box), optional unit, city, state, ZIP.
+FULL_ADDRESS_RE = re.compile(
+    r"(?P<street>P\.?\s*O\.?\s*Box\s+\d+|\d{1,6}\s+(?:(?!\d+\s)[A-Za-z0-9#.'’&-]+\s+){0,6}?"
+    rf"(?:{STREET_SUFFIXES})(?![A-Za-z])(?:\s+(?-i:(?:[NS]\.?[EW]|[NSEW]))\.?(?![A-Za-z]))?)"
+    r"(?P<unit>\s*,?\s*(?:(?:Suite|Ste|Unit|Building|Bldg|Floor|Fl|Room|Rm)\.?(?![A-Za-z])|#)\s*[A-Za-z0-9-]+)?"
+    r"\s*,?\s*(?P<city>[A-Za-z][A-Za-z.'’ -]{0,30}?)\s*,?\s*(?P<state>(?-i:[A-Z]\.?[A-Z]))\.?,?\s+"
+    r"(?P<zip>\d{5}(?:-\d{4})?)(?!\d)",
+    re.IGNORECASE,
+)
+# Words that show a "street" is really page text, e.g. "1715 Clerk of Court".
+ADDRESS_JUNK_RE = re.compile(
+    r"\b(?:chat|text|call|email|e-mail|phone|fax|clerk|division|department|hours|open|closed|"
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|copyright|directions|learn|click|map)\b",
+    re.IGNORECASE,
+)
+# How much each way of finding a value is trusted when ranking.
+METHOD_SCORES = {
+    "json_ld": 5, "tel_link": 4, "mailto_link": 4, "semantic_address": 3,
+    "map_link": 3, "contact_container_text": 2,
+}
+# Staff, board, and directory pages list individual people's contacts.
+LISTING_PAGE_RE = re.compile(
+    r"\b(?:staff|directory|employees?|board|team|leadership|careers?|jobs?|news|blog|events?|calendar)\b",
+    re.IGNORECASE,
+)
+FREE_MAIL_DOMAINS = {
+    "gmail.com", "yahoo.com", "aol.com", "hotmail.com", "outlook.com", "icloud.com", "msn.com",
+    "live.com", "comcast.net", "att.net", "bellsouth.net", "mail.com", "protonmail.com", "ymail.com",
+}
+PLACEHOLDER_EMAIL_DOMAINS = ("example.com", "example.org", "domain.com", "yourdomain.com", "email.com",
+                             "sentry.io", "wixpress.com")
+ROLE_EMAIL_RE = re.compile(
+    r"^(?:info|contact|hello|office|admin|help|support|general|inquiries|questions|hope|services|"
+    r"reception|frontdesk|main|mail)\b",
+    re.IGNORECASE,
+)
+FILE_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "svg", "webp", "css", "js"}
+
+
+def is_listing_page(url: str, label: str = "") -> bool:
+    path = urlparse(url).path
+    if "contact" in path.lower():
+        return False
+    return bool(LISTING_PAGE_RE.search(f"{re.sub(r'[^A-Za-z]+', ' ', path)} {label}"))
+
+
+def page_score(result: dict[str, Any], url: str | None) -> int:
+    """Start and contact pages beat program pages; listing pages rank last."""
+    if not url:
+        return 0
+    if is_listing_page(url):
+        return -3
+    pages = result["extraction"]["pages_checked"]
+    if pages and url == pages[0]:
+        return 2
+    return 2 if re.search(r"contact|location|office|visit|directions", urlparse(url).path, re.I) else 0
+
+
+def row_score(result: dict[str, Any], row: dict[str, Any]) -> int:
+    return METHOD_SCORES.get(row.get("method", ""), 1) + page_score(result, row.get("source_url"))
+
+
+def full_addresses(value: Any) -> list[str]:
+    """Every complete, plausible address inside a piece of text, consistently formatted."""
+    found = []
+    for match in FULL_ADDRESS_RE.finditer(clean_address(value)):
+        street = clean_text(match["street"]).strip(" ,")
+        city = clean_text(match["city"]).strip(" ,.")
+        state = match["state"].replace(".", "")
+        if state not in US_STATES or not city or len(city.split()) > 3:
+            continue
+        if ADDRESS_JUNK_RE.search(f"{street} {city}"):
+            continue
+        unit = clean_text(match["unit"] or "").strip(" ,")
+        found.append(", ".join([street, *([unit] if unit else []), city]) + f", {state} {match['zip']}")
+    return found
+
+
+def address_key(address: str) -> tuple[str, str]:
+    """Same house number (or PO Box) and ZIP means the same place."""
+    box = re.match(r"P\.?\s*O\.?\s*Box\s+(\d+)", address, re.I)
+    number = f"po{box[1]}" if box else re.match(r"\d+", address)[0]
+    return number, re.search(r"(\d{5})(?:-\d{4})?$", address)[1]
+
+
+def phone_key(value: str) -> tuple[str, str] | None:
+    """(ten digits, extension) for a valid US number, else None."""
+    extension = re.search(r"(?:x|ext\.?|extension)\s*(\d{1,6})\s*$", value, re.I)
+    digits = re.sub(r"\D", "", value[: extension.start()] if extension else value)
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    # Area codes and exchanges never start with 0 or 1.
+    if len(digits) != 10 or digits[0] in "01" or digits[3] in "01":
+        return None
+    return digits, extension[1] if extension else ""
+
+
+def format_phone(key: tuple[str, str]) -> str:
+    digits, extension = key
+    return f"({digits[:3]}) {digits[3:6]}-{digits[6:]}" + (f" ext. {extension}" if extension else "")
+
+
+def org_words(result: dict[str, Any]) -> set[str]:
+    name = result["original_fields"]["org_name"]
+    label = normalized_host(result["original_fields"]["website_url"]).split(".")[0]
+    return {word for word in re.findall(r"[a-z]{4,}", f"{name} {label}".lower().replace("-", " "))}
+
+
+def email_rejected(result: dict[str, Any], email: str) -> bool:
+    local, _, domain = email.partition("@")
+    site = normalized_host(result["original_fields"]["website_url"])
+    if domain.rsplit(".", 1)[-1] in FILE_EXTENSIONS or domain.endswith(PLACEHOLDER_EMAIL_DOMAINS):
+        return True
+    if domain != site and site.startswith(domain):
+        return True  # cut off mid-domain, e.g. "...@childrensplaceinc.or"
+    if domain in FREE_MAIL_DOMAINS:
+        # Keep "defendersforchildren@gmail.com"; drop individuals' personal mail.
+        compact = re.sub(r"[^a-z]", "", local)
+        return not any(word in compact for word in org_words(result))
+    return False
+
+
+def provided_phone_keys(value: str) -> set[str]:
+    return {key[0] for key in map(phone_key, split_phone_values(clean_text(value))) if key}
+
+
+def provided_addresses(result: dict[str, Any]) -> list[str]:
+    original = result["original_fields"]
+    street = re.sub(r"\([^)]*\)", "", original["street_address"])  # "(from IRS record)" notes
+    if not usable_value(street):
+        return []
+    return full_addresses(f"{street}, {original['city']}, {original['state']} {original['zip']}")
+
+
+def confirms_address(text: str, address: str) -> bool:
+    """True when page text shows the same street number and street name (or PO Box)."""
+    box = re.match(r"P\.?\s*O\.?\s*Box\s+(\d+)", address, re.I)
+    if box:
+        return bool(re.search(rf"P\.?\s*O\.?\s*Box\s+{box[1]}\b", text, re.I))
+    match = re.match(r"(\d+)\s+(?:(?:N|S|E|W|North|South|East|West)\.?\s+)?([A-Za-z0-9']+)", address)
+    return bool(match) and bool(re.search(
+        rf"\b{match[1]}\s+(?:(?:N|S|E|W|North|South|East|West)\.?\s+)?{re.escape(match[2])}\b", text, re.I))
+
+
+def rank_addresses(result: dict[str, Any], limit: int | None) -> list[dict[str, Any]]:
+    provided_list = provided_addresses(result)
+    provided = {address_key(a) for a in provided_list}
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in result["contacts"]["addresses"]:
+        score = row_score(result, row)
+        for address in full_addresses(row["raw"]):
+            group = groups.setdefault(address_key(address), {"row": None, "score": -99, "seen": 0})
+            group["seen"] += row.get("_seen", 1)
+            # Prefer the most trusted source, then the most detailed wording.
+            if (score, len(address)) > (group["score"], len(group["row"]["raw"]) if group["row"] else 0):
+                group["score"] = score
+                group["row"] = {**row, "raw": address, "kind": address_kind(address)}
+    # A site that shows the table's street without a readable city/ZIP still
+    # confirms it; the city/ZIP then come from the table and say so.
+    for address in provided_list:
+        if address_key(address) in groups:
+            continue
+        rows = [row for row in result["contacts"]["addresses"] if confirms_address(row["raw"], address)]
+        if rows:
+            best = max(rows, key=lambda row: row_score(result, row))
+            groups[address_key(address)] = {
+                "row": {**best, "raw": address, "kind": address_kind(address),
+                        "method": f"{best['method']}_confirms_provided"},
+                "score": row_score(result, best), "seen": sum(row.get("_seen", 1) for row in rows)}
+    ranked = sorted(groups.items(), key=lambda item: -(
+        item[1]["score"] + min(item[1]["seen"], 3) + (4 if item[0] in provided else 0)))
+    return [{k: v for k, v in group["row"].items() if k != "_seen"} for _, group in ranked[:limit]]
+
+
+def rank_phones(result: dict[str, Any], limit: int | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Merge numbers written different ways and decide main vs hotline once per number."""
+    provided_main = provided_phone_keys(result["original_fields"]["org_phone"])
+    provided_hotline = provided_phone_keys(result["original_fields"]["hotline_24_7"])
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for bucket in ("phones", "hotlines_24_7"):
+        for row in result["contacts"][bucket]:
+            key = phone_key(row["raw"])
+            if not key:
+                continue
+            group = groups.setdefault(key, {"rows": [], "main": 0, "hotline": 0})
+            group["rows"].append(row)
+            group["hotline" if bucket == "hotlines_24_7" else "main"] += row.get("_seen", 1)
+
+    main, hotlines = [], []
+    for key, group in groups.items():
+        best = max(group["rows"], key=lambda row: row_score(result, row))
+        score = row_score(result, best) + min(group["main"] + group["hotline"], 3)
+        digits = key[0]
+        if digits in provided_main or digits in provided_hotline:
+            score += 4  # still published on the site, so the table value is confirmed
+        # The source table settles which list a known number belongs in.
+        if digits in provided_hotline and digits in provided_main:
+            kinds = ("main", "hotline")
+        elif digits in provided_hotline:
+            kinds = ("hotline",)
+        elif digits in provided_main:
+            kinds = ("main",)
+        else:
+            kinds = ("hotline",) if group["hotline"] >= group["main"] else ("main",)
+        for kind in kinds:
+            entry = {"raw": format_phone(key), "normalized": f"+1{digits}", "kind": kind,
+                     "source_url": best["source_url"], "method": best["method"]}
+            (hotlines if kind == "hotline" else main).append((score, entry))
+    order = lambda pairs: [entry for _, entry in sorted(pairs, key=lambda pair: -pair[0])[:limit]]
+    return order(main), order(hotlines)
+
+
+def rank_emails(result: dict[str, Any], limit: int | None) -> list[dict[str, Any]]:
+    label = normalized_host(result["original_fields"]["website_url"]).split(".")[0]
+    provided = clean_text(result["original_fields"]["org_email"]).lower()
+    scored = []
+    for row in result["contacts"]["emails"]:
+        email = row["value"]
+        if email_rejected(result, email):
+            continue
+        local, _, domain = email.partition("@")
+        score = row_score(result, row) + min(row.get("_seen", 1), 3)
+        score += 3 if label in domain.split(".") else 0
+        score += 2 if ROLE_EMAIL_RE.match(local) else 0
+        score += 4 if email == provided else 0
+        scored.append((score, {k: v for k, v in row.items() if k != "_seen"}))
+    return [row for _, row in sorted(scored, key=lambda pair: -pair[0])[:limit]]
+
+
+def tidy_contacts(result: dict[str, Any], limit: int | None) -> None:
+    """Replace raw contact lists with validated, de-duplicated, ranked ones."""
+    contacts = result["contacts"]
+    before = {
+        "addresses": len(contacts["addresses"]),
+        "phone numbers": len(contacts["phones"]) + len(contacts["hotlines_24_7"]),
+        "email addresses": len(contacts["emails"]),
+        "map links": len(contacts["map_links"]),
+    }
+    contacts["addresses"] = rank_addresses(result, limit)
+    contacts["phones"], contacts["hotlines_24_7"] = rank_phones(result, limit)
+    contacts["emails"] = rank_emails(result, limit)
+    contacts["map_links"] = [{k: v for k, v in row.items() if k != "_seen"}
+                             for row in contacts["map_links"][:limit]]
+    after = {
+        "addresses": len(contacts["addresses"]),
+        "phone numbers": len({row["normalized"] for row in contacts["phones"] + contacts["hotlines_24_7"]}),
+        "email addresses": len(contacts["emails"]),
+        "map links": len(contacts["map_links"]),
+    }
+    for label, count in before.items():
+        if after[label] < count:
+            result["extraction"]["notes"].append(
+                f"Kept {after[label]} of {count} {label} found; the rest were duplicates, "
+                "incomplete, or lower ranked."
+            )
 
 
 def link_text(link: Any) -> str:
@@ -787,6 +1104,8 @@ def find_contact_pages(soup: Any, page_url: str, root_url: str) -> list[str]:
             continue
         absolute = urljoin(page_url, href)
         if not absolute.startswith(("http://", "https://")) or not same_domain(root_url, absolute):
+            continue
+        if is_listing_page(absolute, link_text(link)):
             continue
         haystack = f"{absolute.lower()} {link_text(link).lower()}"
         matches = sum(keyword in haystack for keyword in CONTACT_KEYWORDS)
@@ -943,6 +1262,29 @@ HTTP_HEADERS = {
 }
 
 
+# Titles of error, outage, and access-check pages.  Seeing one on a site's
+# start page marks the site as failed instead of "no contacts found".
+ERROR_TITLE_RE = re.compile(
+    r"page not found|\bnot found\b|internal server error|bad gateway|service unavailable|gateway time-?out|"
+    r"database error|›\s*error|^\s*error\b|site (?:is )?(?:temporarily )?(?:down|unavailable|offline)|"
+    r"account (?:has been )?suspended|too many requests|forbidden|under construction|coming soon|"
+    r"briefly unavailable|maintenance mode|just a moment|attention required|access denied|"
+    r"checking your browser|are you a robot|captcha",
+    re.IGNORECASE,
+)
+
+
+def error_page_reason(soup: Any) -> str | None:
+    """Describe why a loaded page is an error/blocked/empty page, or return None."""
+    title = clean_text(soup.title.get_text()) if soup.title else ""
+    if ERROR_TITLE_RE.search(title):
+        return f'an error or access check ("{title[:80]}")'
+    body = soup.body or soup
+    if len(clean_text(body.get_text(" ", strip=True))) < 30 and not soup.select_one("a[href]"):
+        return "an empty page"
+    return None
+
+
 def looks_unrendered(soup: Any) -> bool:
     """True for interstitials and JavaScript shells that need a real browser."""
     title = clean_text(soup.title.get_text()) if soup.title else ""
@@ -1057,6 +1399,15 @@ def scrape_one_site(fetch: Any, item: dict[str, Any]) -> dict[str, Any]:
                     continue
                 page_url = actual_url
             soup = load_soup()
+            problem = error_page_reason(soup)
+            if problem:
+                message = f"Page shows {problem}; skipped."
+                if result["extraction"]["pages_checked"]:
+                    # A broken inner link does not make the whole site a failure.
+                    result["extraction"]["notes"].append(f"{page_url}: {message}")
+                else:
+                    result["extraction"]["errors"].append({"source_url": page_url, "message": message})
+                continue
             result["extraction"]["pages_checked"].append(page_url)
             candidates = extract_from_page(result, soup, page_url)
             for candidate in profile_pages(soup, page_url, item["website_url"]):
@@ -1072,8 +1423,10 @@ def scrape_one_site(fetch: Any, item: dict[str, Any]) -> dict[str, Any]:
                 {"source_url": page_url, "message": f"{type(exc).__name__}: {clean_text(exc)[:240]}"}
             )
 
+    max_per_type = item.get("max_per_type", 3) or None
+    tidy_contacts(result, max_per_type)
     set_result_status(result)
-    finalize(result)
+    finalize(result, max_per_type)
     return result
 
 
@@ -1188,6 +1541,7 @@ def run_live_scrape(
     items: list[dict[str, Any]], max_contact_pages: int, delay_seconds: float, headless: bool,
     max_profile_pages: int = 2, workers: int = 4, fetch_mode: str = "browser",
     http_workers: int = 16, page_timeout: float = 30.0, chrome_path: str | None = None,
+    max_per_type: int = 3,
 ) -> list[dict[str, Any]]:
     """Run the live scrape.
 
@@ -1196,7 +1550,8 @@ def run_live_scrape(
     requests, or yield no contacts to Chrome.
     """
     batch = [
-        {**item, "max_contact_pages": max_contact_pages, "max_profile_pages": max_profile_pages}
+        {**item, "max_contact_pages": max_contact_pages, "max_profile_pages": max_profile_pages,
+         "max_per_type": max_per_type}
         for item in items
     ]
     progress = Progress(len(batch))
@@ -1290,6 +1645,11 @@ def parse_args() -> argparse.Namespace:
         help="Path to the Chrome/Chromium executable if Botasaurus cannot find it.",
     )
     parser.add_argument(
+        "--max-per-contact-type", type=int, default=3,
+        help="Keep the best N addresses, phones, hotlines, and emails per organization after "
+             "removing duplicates and invalid values; 0 keeps all of them (default: 3).",
+    )
+    parser.add_argument(
         "--skip-irs", action="store_true",
         help="Do not add IRS status fields (irs_status, irs_last_checked, irs_details).",
     )
@@ -1312,6 +1672,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--delay-seconds must be nonnegative.")
     if args.workers < 1 or args.http_workers < 1:
         parser.error("--workers and --http-workers must be at least 1.")
+    if args.max_per_contact_type < 0:
+        parser.error("--max-per-contact-type must be 0 or more.")
     if args.page_timeout <= 0:
         parser.error("--page-timeout must be positive.")
     if args.inventory_only and args.export_targets:
@@ -1357,6 +1719,7 @@ def main() -> None:
             http_workers=args.http_workers,
             page_timeout=args.page_timeout,
             chrome_path=args.chrome_path,
+            max_per_type=args.max_per_contact_type,
         )
         mode = "live scrape"
 

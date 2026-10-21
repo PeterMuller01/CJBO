@@ -36,12 +36,51 @@ python scrape_charity_contacts.py --input charity_scrape_targets.json --output c
 
 The result is a JSON array. Each object includes `contacts.addresses`,
 `contacts.phones`, `contacts.hotlines_24_7`, `contacts.emails`, and
-`contacts.contact_form_url`. Contact values are arrays so the scraper does not
-throw away extra offices or hotlines.
+`contacts.contact_form_url`. Contact values are arrays so extra offices or
+hotlines are kept, up to a limit (see "How contacts are cleaned up").
 
 Each value records its `source_url` and `method` (for example, `tel_link`,
 `mailto_link`, `json_ld`, or `semantic_address`). Review records marked
 `partial`, `not_found`, `manual_review`, or `failed` before importing them.
+
+`extraction.status` means:
+
+- `success`: an address, a phone number, and an email were all found.
+- `partial`: some were found, or a page had an error.
+- `not_found` / `manual_review`: the site loaded but no contacts were found.
+- `failed`: the site could not be used: it did not load, redirected to
+  another domain, showed an error page (for example "WordPress › Error" or
+  "404"), or showed a bot check such as "Just a moment...". The reason is in
+  `extraction.errors`.
+
+## How contacts are cleaned up
+
+Before a record is saved, every address, phone number, and email is checked,
+merged, and ranked:
+
+- **Addresses** must be complete (street or PO Box, city, state, ZIP). Street
+  fragments and page text that only looks like an address ("1715 Clerk of
+  Court") are dropped. Versions of the same place ("Avenue" vs "Ave.") are
+  merged. If the site shows the street from the source table but not a
+  readable city/ZIP, the table address is kept and its method ends in
+  `_confirms_provided`.
+- **Phone numbers** must be valid US numbers. Formats are merged and every
+  number is written as `(803) 555-0100`. Each number is put in either
+  `phones` or `hotlines_24_7`, using the source table when it knows the number.
+- **Emails** that are image names, placeholders, cut off, or an individual's
+  personal Gmail/Yahoo/etc. address are dropped. Free-mail addresses that are
+  clearly the organization's (like `defendersforchildren@gmail.com`) are kept.
+- **Ranking** prefers values found in structured data or phone/email links,
+  on the home or contact page, shown on several pages, on the organization's
+  own domain, and matching the source table. Staff, board, directory, news,
+  and event pages are not crawled.
+- The best 3 of each type are kept (`--max-per-contact-type`, `0` keeps all).
+  `extraction.notes` says how many were found, for example "Kept 3 of 17
+  phone numbers found".
+
+Profile fields follow the same idea: a rule-based guess (such as an inferred
+category) only fills a field the source table left blank, and differently
+worded descriptions are not counted as conflicts.
 
 For a small first test, add `--limit 3`. If a site behaves differently in
 headless Chrome, retry with `--show-browser`; do not try to bypass a site's
@@ -60,6 +99,7 @@ traffic than before.
 | `--http-workers N` | 16 | Sites fetched at once over plain HTTP in `auto` mode. |
 | `--page-timeout S` | 30 | Seconds to wait for one page before recording an error. |
 | `--chrome-path PATH` | — | Chrome/Chromium executable, if Botasaurus cannot find it. |
+| `--max-per-contact-type N` | 3 | Best addresses, phones, hotlines, and emails kept per organization; `0` keeps all. |
 
 If Chrome crashes during a run, that site is retried in a fresh browser
 instead of every remaining site failing.
