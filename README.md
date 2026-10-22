@@ -63,8 +63,8 @@ access protections.
 
 ## How contacts are graded
 
-Every valid phone number, address, and email is kept and given points, a
-confidence label, and the reasons for its score. The main idea: an
+Every valid phone number, address, and email is given points, a confidence
+label, and the reasons for its score, and the 5 best of each are kept. The main idea: an
 organization's own number or address is usually repeated on most of its pages
 (header, footer, contact page), while a partner's or program's appears once.
 
@@ -134,7 +134,8 @@ organizations, chapters, and government offices often repeat a head-office
 number on every page, so their primary phone can outscore the local one; this
 note catches those cases.
 
-Use `--max-per-contact-type N` to keep only the N best entries of each type.
+Use `--max-per-contact-type N` to keep a different number of entries of each
+type (`0` keeps every valid one).
 
 Profile fields follow the same idea: a rule-based guess (such as an inferred
 category) only fills a field the source table left blank, and differently
@@ -153,7 +154,7 @@ traffic than before.
 | `--http-workers N` | 16 | Sites fetched at once over plain HTTP in `auto` mode. |
 | `--page-timeout S` | 30 | Seconds to wait for one page before recording an error. |
 | `--chrome-path PATH` | none | Chrome/Chromium executable, if Botasaurus cannot find it. |
-| `--max-per-contact-type N` | 0 | Keep only the N best-graded addresses, phones, and emails; `0` keeps all. |
+| `--max-per-contact-type N` | 5 | Best-graded addresses, phones, emails, and map links kept per organization; `0` keeps all. |
 
 If Chrome crashes during a run, that site is retried in a fresh browser
 instead of every remaining site failing.

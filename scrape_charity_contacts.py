@@ -1199,12 +1199,21 @@ def contact_review_reasons(result: dict[str, Any]) -> list[str]:
     return reasons
 
 
+def keep_best(entries: list[dict[str, Any]], limit: int | None) -> list[dict[str, Any]]:
+    """The top ``limit`` entries by score, always including the primary one."""
+    kept = entries[:limit]
+    primary = next((entry for entry in entries if entry["primary"]), None)
+    if primary and primary not in kept:
+        kept = kept[:-1] + [primary]  # e.g. a street address chosen over higher-scoring PO Boxes
+    return kept
+
+
 def tidy_contacts(result: dict[str, Any], limit: int | None) -> None:
     """Replace raw contact lists with validated, merged, graded ones."""
     contacts = result["contacts"]
-    contacts["addresses"] = grade_addresses(result)[:limit]
-    contacts["phones"] = grade_phones(result)[:limit]
-    contacts["emails"] = grade_emails(result)[:limit]
+    contacts["addresses"] = keep_best(grade_addresses(result), limit)
+    contacts["phones"] = keep_best(grade_phones(result), limit)
+    contacts["emails"] = keep_best(grade_emails(result), limit)
     contacts["map_links"] = [{k: v for k, v in row.items() if k != "_seen"}
                              for row in contacts["map_links"]][:limit]
     result["extraction"]["contact_review"] = contact_review_reasons(result)
@@ -1689,7 +1698,7 @@ def run_live_scrape(
     items: list[dict[str, Any]], max_contact_pages: int, delay_seconds: float, headless: bool,
     max_profile_pages: int = 2, workers: int = 4, fetch_mode: str = "browser",
     http_workers: int = 16, page_timeout: float = 30.0, chrome_path: str | None = None,
-    max_per_type: int = 0,
+    max_per_type: int = 5,
 ) -> list[dict[str, Any]]:
     """Run the live scrape.
 
@@ -1793,9 +1802,9 @@ def parse_args() -> argparse.Namespace:
         help="Path to the Chrome/Chromium executable if Botasaurus cannot find it.",
     )
     parser.add_argument(
-        "--max-per-contact-type", type=int, default=0,
-        help="Keep only the N best-graded addresses, phones, and emails per organization; "
-             "0 keeps every valid one with its score (default: 0).",
+        "--max-per-contact-type", type=int, default=5,
+        help="Keep the N best-graded addresses, phones, emails, and map links per organization; "
+             "0 keeps every valid one with its score (default: 5).",
     )
     parser.add_argument(
         "--limit",
