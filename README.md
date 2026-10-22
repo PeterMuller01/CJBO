@@ -1,14 +1,14 @@
 # Charity contact scraper
 
 This package turns the 58 organization websites in the supplied table into a
-reviewable JSON file. It collects public phone numbers, 24/7 hotlines, email
-addresses, mailing/physical addresses, and a contact-form URL when one is
-found. It also checks each EIN against IRS bulk data (see "IRS status" below).
+reviewable JSON file for the CJB Outreach Finding Charity database. For each
+organization it collects public phone numbers, email addresses,
+mailing/physical addresses, and a contact-form URL when one is found, grades
+every value, and puts the best one of each into the main database fields.
 
-Every output record also keeps the original organization fields: ID, name,
-organization type, category, description, area served, website URL, original
-contact fields, address fields, EIN, active status, last-checked date, and
-notes. Freshly scraped values are placed separately under `contacts`.
+Every output record also keeps the original organization fields from the
+table (ID, name, category, description, website URL, contact fields, address
+fields, EIN, active status, and last-checked date) under `original_fields`.
 
 The scraper does not try to defeat protections or infer missing data. It
 checks the supplied page and at most two same-domain Contact/Location pages,
@@ -18,11 +18,10 @@ their shelter locations are confidential.
 
 ## Files
 
-- `scrape_charity_contacts.py` — the Botasaurus scraper and JSON converter.
-- `irs_status.py` — the IRS exempt-status check (also runs on its own).
-- `compare_outputs.py` — compares two output files record by record.
-- `charity_scrape_targets.json` — the cleaned 58-site input list.
-- `charity_contact_inventory.json` — the existing contact values from the
+- `scrape_charity_contacts.py`: the Botasaurus scraper and JSON converter.
+- `compare_outputs.py`: compares two output files record by record.
+- `charity_scrape_targets.json`: the cleaned 58-site input list.
+- `charity_contact_inventory.json`: the existing contact values from the
   supplied table, converted to JSON. This is not a fresh web scrape.
 
 ## Run a fresh scrape
@@ -34,14 +33,17 @@ python -m pip install -r requirements.txt
 python scrape_charity_contacts.py --input charity_scrape_targets.json --output charity_contacts_live.json
 ```
 
-The result is a JSON array. Each object includes `contacts.addresses`,
-`contacts.phones`, `contacts.hotlines_24_7`, `contacts.emails`, and
-`contacts.contact_form_url`. Contact values are arrays so extra offices or
-hotlines are kept, up to a limit (see "How contacts are cleaned up").
+The result is a JSON array with one record per organization. The main fields
+are `org_name`, `category`, `org_description`, `website_url`, `org_phone`,
+`org_email`, `street_address`, `city`, `state`, `zip`, `ein`, `is_active`, and
+`last_checked`. Every graded value is under `contacts.phones`,
+`contacts.addresses`, and `contacts.emails`.
 
-Each value records its `source_url` and `method` (for example, `tel_link`,
-`mailto_link`, `json_ld`, or `semantic_address`). Review records marked
-`partial`, `not_found`, `manual_review`, or `failed` before importing them.
+For a small first test, add `--limit 3`. If a site behaves differently in
+headless Chrome, retry with `--show-browser`; do not try to bypass a site's
+access protections.
+
+## Scrape status and is_active
 
 `extraction.status` means:
 
@@ -53,38 +55,90 @@ Each value records its `source_url` and `method` (for example, `tel_link`,
   "404"), or showed a bot check such as "Just a moment...". The reason is in
   `extraction.errors`.
 
-## How contacts are cleaned up
+`is_active` is set from that status:
 
-Before a record is saved, every address, phone number, and email is checked,
-merged, and ranked:
+- `success` or `partial`: `Yes`.
+- anything else: `Unsuccessful check, manual review`. The site may only have
+  been down during the check, so a person should look at it later.
+
+## How contacts are graded
+
+Every valid phone number, address, and email is kept and given points, a
+confidence label, and the reasons for its score. The main idea: an
+organization's own number or address is usually repeated on most of its pages
+(header, footer, contact page), while a partner's or program's appears once.
+
+| Signal | Points |
+| --- | --- |
+| Shown on a checked page (per page, up to 5 pages) | +2 each |
+| Mentioned again on those pages (up to 3) | +1 each |
+| Matches the client's existing list | +3 |
+| Clickable phone/email link, or the site's structured data | +2 |
+| In an address/contact section, or a map link | +1 |
+| On the home page or a contact page | +1 |
+| Address in the client's state / in a different state | +1 / -3 |
+| Email on the organization's own website domain | +2 |
+| General inbox (`info@`, `contact@`, ...) / special-purpose inbox (web admin, volunteer, donations, ...) | +1 / -2 |
+| Phone link that dials a different number than it shows | -3 |
+| Well-known national hotline (RAINN, trafficking, Childhelp, ...) | -6 |
+
+Confidence: `high` is 9 or more points, `medium` 5 to 8, `low` 4 or less.
+
+The top-scoring phone and email are marked `"primary": true` and fill
+`org_phone` and `org_email`. For the address, the top-scoring street address
+with medium or high confidence is primary (a place people can visit), and a
+PO Box is used only when there is none. `field_sources` shows the score and
+confidence of each primary value.
+
+Each entry looks like this:
+
+```json
+{
+  "raw": "(864) 227-1623",
+  "normalized": "+18642271623",
+  "labeled_hotline": true,
+  "score": 17,
+  "confidence": "high",
+  "primary": true,
+  "reasons": ["+8 shown on 4 of 4 pages checked", "+3 mentioned 13 times in all",
+              "+1 on the home page or a contact page", "+2 clickable phone/email link",
+              "+3 matches the client's list", "labeled on the site as a hotline/24-7/crisis line"]
+}
+```
+
+Before grading, values are checked and merged:
 
 - **Addresses** must be complete (street or PO Box, city, state, ZIP). Street
   fragments and page text that only looks like an address ("1715 Clerk of
-  Court") are dropped. Versions of the same place ("Avenue" vs "Ave.") are
-  merged. If the site shows the street from the source table but not a
-  readable city/ZIP, the table address is kept and its method ends in
-  `_confirms_provided`.
+  Court") are dropped, and versions of the same place ("Avenue" vs "Ave.")
+  are merged.
 - **Phone numbers** must be valid US numbers. Formats are merged and every
-  number is written as `(803) 555-0100`. Each number is put in either
-  `phones` or `hotlines_24_7`, using the source table when it knows the number.
+  number is written as `(803) 555-0100`. Hotlines are graded like any other
+  number; `labeled_hotline` says the site labels it as a 24/7 or crisis line.
 - **Emails** that are image names, placeholders, cut off, or an individual's
   personal Gmail/Yahoo/etc. address are dropped. Free-mail addresses that are
   clearly the organization's (like `defendersforchildren@gmail.com`) are kept.
-- **Ranking** prefers values found in structured data or phone/email links,
-  on the home or contact page, shown on several pages, on the organization's
-  own domain, and matching the source table. Staff, board, directory, news,
-  and event pages are not crawled.
-- The best 3 of each type are kept (`--max-per-contact-type`, `0` keeps all).
-  `extraction.notes` says how many were found, for example "Kept 3 of 17
-  phone numbers found".
+- **The client's existing values are confirmed anywhere on a page.** The
+  scraper normally reads plain text only in footers and contact sections, so
+  it does not pick up partners' details. A phone, email, or street that is
+  already in the client's list is also looked for in the full page text;
+  those entries show the method `confirmed_on_page` (or end in
+  `_confirms_provided` for addresses).
+- **Phone links that dial a different number than they show** are noted in
+  `extraction.notes`; the shown number is graded normally.
+- Staff, board, directory, news, and event pages are not crawled.
+
+`extraction.contact_review` lists anything a person should check, for
+example "Primary phone (877) 969-0010 differs from the client's list". National
+organizations, chapters, and government offices often repeat a head-office
+number on every page, so their primary phone can outscore the local one; this
+note catches those cases.
+
+Use `--max-per-contact-type N` to keep only the N best entries of each type.
 
 Profile fields follow the same idea: a rule-based guess (such as an inferred
 category) only fills a field the source table left blank, and differently
 worded descriptions are not counted as conflicts.
-
-For a small first test, add `--limit 3`. If a site behaves differently in
-headless Chrome, retry with `--show-browser`; do not try to bypass a site's
-access protections.
 
 ## Speed options
 
@@ -98,15 +152,16 @@ traffic than before.
 | `--fetch-mode auto` | `browser` | Fetch pages with plain HTTP first and open Chrome only for sites that need JavaScript, block plain requests, or return no contacts. Much faster. |
 | `--http-workers N` | 16 | Sites fetched at once over plain HTTP in `auto` mode. |
 | `--page-timeout S` | 30 | Seconds to wait for one page before recording an error. |
-| `--chrome-path PATH` | — | Chrome/Chromium executable, if Botasaurus cannot find it. |
-| `--max-per-contact-type N` | 3 | Best addresses, phones, hotlines, and emails kept per organization; `0` keeps all. |
+| `--chrome-path PATH` | none | Chrome/Chromium executable, if Botasaurus cannot find it. |
+| `--max-per-contact-type N` | 0 | Keep only the N best-graded addresses, phones, and emails; `0` keeps all. |
 
 If Chrome crashes during a run, that site is retried in a fresh browser
 instead of every remaining site failing.
 
 `--fetch-mode auto` reads the HTML the server sends instead of the page after
-Chrome has run its scripts. For most sites that is the same content, but
-compare once on the real sites before relying on it:
+Chrome has run its scripts. For most sites that is the same content, but some
+sites only reveal email addresses with JavaScript, so compare once on the real
+sites before relying on it:
 
 ```bash
 python scrape_charity_contacts.py --output run_browser.json
@@ -116,39 +171,6 @@ python compare_outputs.py run_browser.json run_auto.json
 
 `extraction.fetch_method` in each record says whether it came from `http` or
 `browser`.
-
-## IRS status
-
-Each record gets three new fields. `is_active` is **not** changed; the IRS
-result is kept separate so it can be reviewed first.
-
-- `irs_status`
-  - `active` — EIN is in the IRS Exempt Organizations Business Master File
-    and not currently revoked.
-  - `revoked` — EIN is on the IRS automatic revocation list (no return filed
-    for three years) with no later reinstatement.
-  - `not_found` — EIN is in neither file. Check for a wrong EIN, or a chapter
-    or church covered by a parent organization's group exemption.
-  - `no_ein` — no EIN on file (government agencies).
-  - `invalid_ein` — the EIN is not nine digits.
-  - `not_checked` — the IRS files could not be downloaded.
-- `irs_last_checked` — date the check ran (YYYY-MM-DD).
-- `irs_details` — what the IRS files say: legal name, city/state, latest tax
-  period filed, ruling date, revocation/reinstatement dates, the IRS data
-  date, and `review_reasons` explaining anything that needs a human look
-  (for example, an IRS legal name that does not resemble `org_name`).
-
-The four nationwide BMF region files and the revocation list are downloaded
-into `irs_data/` (about 300 MB) and reused for 24 hours
-(`--irs-max-age-hours`). After that, the scraper asks the IRS whether the
-files changed and downloads them again only if they did. The download
-runs while the websites are being scraped. Use `--skip-irs` to turn it off.
-
-To add or refresh IRS fields on an existing file without scraping:
-
-```bash
-python irs_status.py --input charity_contacts_live.json
-```
 
 ## Rebuild the included JSON files
 

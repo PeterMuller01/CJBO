@@ -2,8 +2,8 @@
 """Collect public charity organization profiles and contacts with Botasaurus.
 
 The script accepts either the supplied Markdown table or a cleaned JSON target
-list.  It preserves every public address, phone number, and email it finds
-instead of silently selecting only one value.
+list.  Every valid public address, phone number, and email it finds is kept
+with a score; the top-graded one of each fills the main database fields.
 
 Examples:
     # Create a portable target file from the supplied Markdown table.
@@ -96,8 +96,7 @@ EMAIL_RE = re.compile(
 )
 
 
-FIELDS = ('org_name', 'org_type', 'category', 'org_description', 'area_served',
-          'website_url', 'ein', 'is_active')
+FIELDS = ('org_name', 'category', 'org_description', 'website_url', 'ein')
 PROFILE_WORDS = ('about', 'mission', 'who we are', 'services', 'service area', 'where we serve')
 
 
@@ -122,8 +121,8 @@ def add(result, field, value, url, method, priority=50):
 def initialize(result):
     result['organization_details'] = {field: [] for field in FIELDS}
     result['original_fields'] = {k: result[k] for k in (
-        *FIELDS, 'org_phone', 'hotline_24_7', 'org_email', 'street_address',
-        'city', 'state', 'zip', 'last_checked', 'org_notes')}
+        *FIELDS, 'org_phone', 'org_email', 'street_address',
+        'city', 'state', 'zip', 'is_active', 'last_checked')}
     result['field_sources'] = {
         field: dict(value=value, source_url=None,
                     method='provided_inventory' if value else 'not_found')
@@ -148,19 +147,10 @@ def place_names(value):
 def structured(result, obj, url):
     """Caller has already matched this entity to the target organization."""
     for field, key in [('org_name', 'name'), ('org_description', 'description'),
-                       ('area_served', 'areaServed'), ('category', 'category')]:
+                       ('category', 'category')]:
         value = place_names(obj.get(key))
         add(result, field, value[:600] if field == 'org_description' else value,
             url, 'matched_json_ld', 100)
-    if not obj.get('areaServed'):
-        add(result, 'area_served', place_names(obj.get('serviceArea')), url, 'matched_json_ld', 100)
-    kind = obj.get('@type', [])
-    kinds = {str(v).lower() for v in (kind if isinstance(kind, list) else [kind])}
-    if kinds & {'nonprofitorganization', 'ngo', 'charity'} or obj.get('nonprofitStatus'):
-        add(result, 'org_type', 'Nonprofit', url, 'matched_json_ld', 100)
-    elif 'governmentorganization' in kinds:
-        add(result, 'org_type', 'Government agency', url, 'matched_json_ld', 100)
-    # Generic Organization/LocalBusiness does not establish legal type.
     for key in ('taxID', 'taxId'):
         value = ein(obj.get(key))
         if value:
@@ -218,23 +208,6 @@ def extract(result, soup, url):
             mission_blocks.append(block)
             if len(block) >= 40:
                 add(result, 'org_description', block[:600], url, 'self_description_text', 60)
-            if re.search(rf'\b{subject}\s+(?:is|are)\s+(?:an?\s+)?(?:(?:registered|private|independent|community|charitable|501\(c\)\(3\))\s+)*(?:non[ -]?profit|not.for.profit)\b', block, re.I):
-                add(result, 'org_type', 'Nonprofit', url, 'self_description_text', 80)
-            if re.search(rf'\b{subject}\s+(?:is|are)\s+(?:an?\s+)?501\s*\(c\)\s*\(3\)', block, re.I):
-                add(result, 'org_type', 'Nonprofit', url, 'self_description_text', 80)
-            if re.search(rf'\b{subject}\s+(?:is|are)\s+(?:an?\s+)?(?:local |county |state |federal )?government agency\b', block, re.I):
-                add(result, 'org_type', 'Government agency', url, 'self_description_text', 80)
-            # Keep the service-area statement intact rather than guessing borders.
-            area = re.search(r'[^.!?]*(?:\bwe serve\b|\bour service area\b|\bserving (?:the )?(?:residents|people|families|communities|counties)\b)[^.!?]*[.!?]?', block, re.I)
-            # "We serve 500 families a year" is not a service area; require a place.
-            if area and len(area[0]) <= 250 and re.search(
-                    r'\b(?:count(?:y|ies)|statewide|state of|south carolina|SC|upstate|midlands|low ?country|pee dee|region)\b',
-                    area[0], re.I):
-                add(result, 'area_served', area[0].strip(), url, 'service_area_statement', 80)
-            if re.search(rf'\b{subject}\s+(?:is|are|has|have)\s+(?:now |permanently )?(?:closed|ceased operations|no longer operating)\b', block, re.I):
-                add(result, 'is_active', 'No', url, 'explicit_operating_statement', 100)
-            elif re.search(rf'\b{subject}\s+(?:(?:is|are)\s+(?:currently )?(?:open|operating)|(?:continues?|continue) to (?:operate|provide services))\b', block, re.I):
-                add(result, 'is_active', 'Yes', url, 'explicit_operating_statement', 80)
         # EIN needs a tax label; never take an arbitrary nine-digit number.
         # A block naming a different entity is still a reviewable candidate.
         match = re.search(r'\b(?:EIN|employer identification number|federal tax (?:ID|identification)(?: number)?)\s*[:#-]?\s*(\d{2}-?\d{7})\b', block, re.I)
@@ -270,6 +243,17 @@ def profile_pages(soup, url, root):
     return pages
 
 
+# A scrape with these statuses read the website, so the charity is marked active.
+ACTIVE_STATUSES = ('success', 'partial')
+UNCHECKED_ACTIVE = 'Unsuccessful check, manual review'
+
+
+def source_of(row, key):
+    """Where a flat field's value came from, including its grade."""
+    return {'value': row[key], 'source_url': row.get('source_url'), 'method': row.get('method'),
+            **{k: row[k] for k in ('score', 'confidence') if k in row}}
+
+
 # Rule-based guesses (priority below this) only fill fields the table left blank.
 WEAK_PRIORITY = 50
 # Sites word their own description several ways, so that is not a conflict.
@@ -285,7 +269,7 @@ def comparable(field, value):
 
 def has_conflict(field, rows):
     keys = {comparable(field, row['value']) for row in rows} - {''}
-    if field in ('org_name', 'area_served'):
+    if field == 'org_name':
         # "Beyond Abuse" and "Surviving Child Abuse | Beyond Abuse" agree.
         keys = {key for key in keys if not any(key != other and f' {key} ' in f' {other} ' for other in keys)}
     return len(keys) > 1
@@ -306,15 +290,15 @@ def finalize(result, max_values=None):
             result['field_sources'][field] = dict(
                 value=baseline, source_url=None,
                 method='provided_inventory' if baseline else 'not_found')
-    # Scraped primary values use exactly the requested flat schema. All others
-    # remain available in contacts and original_fields.
+    # The primary (top-graded) entry fills each flat database field; every
+    # graded entry stays in contacts with its score and reasons.
     for field, bucket, key in [('org_phone', 'phones', 'raw'),
-                               ('hotline_24_7', 'hotlines_24_7', 'raw'),
                                ('org_email', 'emails', 'value')]:
         values = result['contacts'][bucket]
         if values:
-            result[field] = values[0][key]
-            result['field_sources'][field] = dict(values[0])
+            best = next((row for row in values if row.get('primary')), values[0])
+            result[field] = best[key]
+            result['field_sources'][field] = source_of(best, key)
         else:
             result[field] = result['original_fields'][field]
             result['field_sources'][field] = dict(value=result[field], source_url=None,
@@ -326,13 +310,14 @@ def finalize(result, max_values=None):
             result['field_sources'][field] = dict(value=result[field], source_url=None,
                 method='provided_inventory' if result[field] else 'not_found')
     if addresses:
-        best = next((row for row in addresses if row['kind'] == 'physical'), addresses[0])
+        best = (next((row for row in addresses if row.get('primary')), None)
+                or next((row for row in addresses if row['kind'] == 'physical'), addresses[0]))
         raw = best['raw']
         locality = re.match(r'^(.*?),\s*([A-Za-z .\'-]+),?\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)$', raw)
         if locality:
             for field, value in zip(('street_address', 'city', 'state', 'zip'), locality.groups()):
                 result[field] = value.strip()
-                result['field_sources'][field] = dict(value=value.strip(), source_url=best['source_url'], method=best['method'])
+                result['field_sources'][field] = {**source_of(best, 'raw'), 'value': value.strip()}
         else:
             # Do not combine a newly found street with a stale city/ZIP.
             result['street_address'] = raw
@@ -351,15 +336,22 @@ def finalize(result, max_values=None):
         for candidates in result['organization_details'].values():
             candidates.sort(key=lambda row: -row['priority'])
             del candidates[max_values:]
-    if result['data_origin'] == 'live_scrape' and result['extraction']['pages_checked']:
-        result['last_checked'] = result['scraped_at'][:10]
-        result['field_sources']['last_checked'] = dict(
-            value=result['last_checked'], source_url=None, method='website_check_date')
-    if result['org_id'] in {'CF-036', 'CF-037'}:
+    if result['data_origin'] == 'live_scrape':
+        if result['extraction']['pages_checked']:
+            result['last_checked'] = result['scraped_at'][:10]
+            result['field_sources']['last_checked'] = dict(
+                value=result['last_checked'], source_url=None, method='website_check_date')
+        # Active status follows whether this check could read the website; a
+        # failed check is left for a person, since the site may just be down.
+        status = result['extraction']['status']
+        result['is_active'] = 'Yes' if status in ACTIVE_STATUSES else UNCHECKED_ACTIVE
+        result['field_sources']['is_active'] = dict(
+            value=result['is_active'], source_url=None, method=f'scrape_status_{status}')
+    if result['org_id'] in PRIVATE_ADDRESS_ORG_IDS:
         for fields in (result, result['original_fields']):
-            for field in ('street_address', 'city', 'state', 'zip', 'org_notes'):
+            for field in ('street_address', 'city', 'state', 'zip'):
                 fields[field] = ''
-        for field in ('street_address', 'city', 'state', 'zip', 'org_notes'):
+        for field in ('street_address', 'city', 'state', 'zip'):
             result['field_sources'][field] = dict(value='', source_url=None, method='confidential_location_omitted')
 
 
@@ -430,10 +422,8 @@ def source_item(record: dict[str, Any]) -> dict[str, Any]:
         "org_name": clean_text(
             record.get("organization_name") or record.get("org_name")
         ),
-        "org_type": clean_text(record.get("org_type")),
         "category": clean_text(record.get("category")),
         "org_description": clean_text(record.get("org_description")),
-        "area_served": clean_text(record.get("area_served")),
         "website_url": markdown_url(
             record.get("source_url") or record.get("website_url")
         ),
@@ -441,9 +431,6 @@ def source_item(record: dict[str, Any]) -> dict[str, Any]:
         "is_active": clean_text(record.get("is_active")),
         "source_fields": {
             "org_phone": clean_text(existing.get("org_phone", record.get("org_phone"))),
-            "hotline_24_7": clean_text(
-                existing.get("hotline_24_7", record.get("hotline_24_7"))
-            ),
             "org_email": clean_text(existing.get("org_email", record.get("org_email"))),
             "street_address": clean_text(
                 existing.get("street_address", record.get("street_address"))
@@ -451,7 +438,6 @@ def source_item(record: dict[str, Any]) -> dict[str, Any]:
             "city": clean_text(existing.get("city", record.get("city"))),
             "state": clean_text(existing.get("state", record.get("state"))),
             "zip": clean_text(existing.get("zip", record.get("zip"))),
-            "org_notes": clean_text(existing.get("org_notes", record.get("org_notes"))),
             "last_checked": clean_text(
                 existing.get("last_checked", record.get("last_checked"))
             ),
@@ -499,13 +485,10 @@ def new_result(item: dict[str, Any], data_origin: str) -> dict[str, Any]:
     result = {
         "org_id": item["org_id"],
         "org_name": item["org_name"],
-        "org_type": item["org_type"],
         "category": item["category"],
         "org_description": item["org_description"],
-        "area_served": item["area_served"],
         "website_url": item["website_url"],
         "org_phone": fields["org_phone"],
-        "hotline_24_7": fields["hotline_24_7"],
         "org_email": fields["org_email"],
         "street_address": fields["street_address"],
         "city": fields["city"],
@@ -514,13 +497,11 @@ def new_result(item: dict[str, Any], data_origin: str) -> dict[str, Any]:
         "ein": item["ein"],
         "is_active": item["is_active"],
         "last_checked": fields["last_checked"],
-        "org_notes": fields["org_notes"],
         "scraped_at": utc_now() if data_origin == "live_scrape" else None,
         "data_origin": data_origin,
         "contacts": {
             "addresses": [],
             "phones": [],
-            "hotlines_24_7": [],
             "emails": [],
             "contact_form_url": None,
             "map_links": [],
@@ -603,7 +584,6 @@ def build_inventory(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     {
                         "raw": address,
                         "kind": address_kind(address),
-                        "published": None,
                         "source_url": None,
                         "method": "provided_inventory",
                     },
@@ -618,22 +598,6 @@ def build_inventory(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     {
                         "raw": phone,
                         "normalized": phone_normalized(phone),
-                        "kind": "main",
-                        "source_url": None,
-                        "method": "provided_inventory",
-                    },
-                    "raw",
-                )
-
-        hotline = usable_value(item["source_fields"].get("hotline_24_7"))
-        if hotline:
-            for phone in split_phone_values(hotline):
-                unique_add(
-                    result["contacts"]["hotlines_24_7"],
-                    {
-                        "raw": phone,
-                        "normalized": phone_normalized(phone),
-                        "kind": "hotline",
                         "source_url": None,
                         "method": "provided_inventory",
                     },
@@ -646,7 +610,6 @@ def build_inventory(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 result["contacts"]["emails"],
                 {
                     "value": email.lower(),
-                    "kind": "general",
                     "source_url": None,
                     "method": "provided_inventory",
                 },
@@ -753,7 +716,6 @@ def add_address(result: dict[str, Any], value: Any, page_url: str, method: str) 
             {
                 "raw": address,
                 "kind": address_kind(address),
-                "published": True,
                 "source_url": page_url,
                 "method": method,
             },
@@ -765,22 +727,25 @@ def add_address(result: dict[str, Any], value: Any, page_url: str, method: str) 
 def add_phone(
     result: dict[str, Any], value: Any, page_url: str, method: str, context: str = ""
 ) -> None:
+    hotline = phone_kind(context) == "hotline"
     for phone in split_phone_values(clean_text(value)):
-        destination = (
-            result["contacts"]["hotlines_24_7"] if phone_kind(context) == "hotline" else result["contacts"]["phones"]
-        )
+        phones = result["contacts"]["phones"]
         unique_add(
-            destination,
+            phones,
             {
                 "raw": phone,
                 "normalized": phone_normalized(phone),
-                "kind": "hotline" if destination is result["contacts"]["hotlines_24_7"] else "main",
+                "labeled_hotline": hotline,
                 "source_url": page_url,
                 "method": method,
             },
             "raw",
             count=True,
         )
+        if hotline:
+            for row in phones:
+                if row["raw"].lower() == phone.lower():
+                    row["labeled_hotline"] = True
 
 
 def add_email(result: dict[str, Any], value: Any, page_url: str, method: str) -> None:
@@ -789,7 +754,6 @@ def add_email(result: dict[str, Any], value: Any, page_url: str, method: str) ->
             result["contacts"]["emails"],
             {
                 "value": email.lower(),
-                "kind": "general",
                 "source_url": page_url,
                 "method": method,
             },
@@ -877,22 +841,6 @@ def is_listing_page(url: str, label: str = "") -> bool:
     return bool(LISTING_PAGE_RE.search(f"{re.sub(r'[^A-Za-z]+', ' ', path)} {label}"))
 
 
-def page_score(result: dict[str, Any], url: str | None) -> int:
-    """Start and contact pages beat program pages; listing pages rank last."""
-    if not url:
-        return 0
-    if is_listing_page(url):
-        return -3
-    pages = result["extraction"]["pages_checked"]
-    if pages and url == pages[0]:
-        return 2
-    return 2 if re.search(r"contact|location|office|visit|directions", urlparse(url).path, re.I) else 0
-
-
-def row_score(result: dict[str, Any], row: dict[str, Any]) -> int:
-    return METHOD_SCORES.get(row.get("method", ""), 1) + page_score(result, row.get("source_url"))
-
-
 def full_addresses(value: Any) -> list[str]:
     """Every complete, plausible address inside a piece of text, consistently formatted."""
     found = []
@@ -965,127 +913,314 @@ def provided_addresses(result: dict[str, Any]) -> list[str]:
     return full_addresses(f"{street}, {original['city']}, {original['state']} {original['zip']}")
 
 
-def confirms_address(text: str, address: str) -> bool:
-    """True when page text shows the same street number and street name (or PO Box)."""
+# --- Grading -------------------------------------------------------------
+#
+# Every valid phone, address, and email gets points, a confidence label, and
+# the reasons for its score.  The main signal is how often the value appears
+# across the pages checked: an organization's own number or address is
+# usually repeated on most pages (header/footer/contact page), while a
+# partner's or program's appears once.
+
+POINTS = {
+    "per_page": 2,          # shown on a checked page (counted for up to 5 pages)
+    "extra_mention": 1,     # each extra mention on those pages (up to 3)
+    "client_match": 3,      # matches the client's existing list
+    "strong_source": 2,     # phone/email link or the site's structured data
+    "section_source": 1,    # address/contact section, map link, or link text
+    "key_page": 1,          # on the home page or a contact page
+    "same_state": 1,
+    "other_state": -3,
+    "own_domain": 2,
+    "general_inbox": 1,
+    "special_inbox": -2,
+    "hidden_link": -3,      # link dials a number it does not show
+    "national_hotline": -6,
+}
+HIGH_CONFIDENCE, MEDIUM_CONFIDENCE = 9, 5
+STRONG_METHODS = {"tel_link", "tel_link_text", "mailto_link", "json_ld"}
+SECTION_METHODS = {"semantic_address", "map_link", "contact_container_text"}
+SPECIAL_EMAIL_RE = re.compile(
+    r"web ?(?:master|manager|admin)|privacy|no-?reply|donotreply|volunteer|donat|development|giving|"
+    r"career|jobs|press|media|marketing|events|billing|newsletter",
+    re.IGNORECASE,
+)
+# National lines that many charity sites list but that are not the charity's own.
+NATIONAL_HOTLINES = {
+    "8007997233": "National Domestic Violence Hotline",
+    "8006564673": "RAINN Sexual Assault Hotline",
+    "8883737888": "National Human Trafficking Hotline",
+    "8002738255": "National Suicide Prevention Lifeline",
+    "8004224453": "Childhelp National Child Abuse Hotline",
+    "8663319474": "love is respect",
+    "8006624357": "SAMHSA National Helpline",
+    "8009506264": "NAMI HelpLine",
+}
+
+
+def visible_text(soup: Any) -> str:
+    """Page text a visitor sees (no scripts, styles, or comments)."""
+    skip = {"script", "style", "noscript", "template"}
+    return clean_text(" ".join(
+        node for node in soup.find_all(string=True)
+        if node.parent.name not in skip and type(node).__name__ == "NavigableString"
+    ))
+
+
+def record_page(result: dict[str, Any], soup: Any, page_url: str) -> None:
+    """Keep what grading needs from a page; removed before the record is saved."""
+    result.setdefault("_pages", {})[page_url] = {
+        "text": visible_text(soup),
+        "tel": [key[0] for key in (phone_key(unquote(a.get("href", "")[4:]).split("?", 1)[0])
+                                   for a in soup.select('a[href^="tel:"]')) if key],
+        "mailto": [unquote(a.get("href", "")[7:]).split("?", 1)[0].strip().lower()
+                   for a in soup.select('a[href^="mailto:"]')],
+    }
+
+
+def phone_pattern(digits: str) -> re.Pattern:
+    a, e, n = digits[:3], digits[3:6], digits[6:]
+    return re.compile(rf"(?<!\d)(?:\+?1[\s.\-]*)?\(?{a}\)?[\s.\-]*{e}[\s.\-]*{n}(?!\d)")
+
+
+def address_pattern(address: str) -> re.Pattern | None:
+    """Street number + street name (or PO Box number), however it is written."""
     box = re.match(r"P\.?\s*O\.?\s*Box\s+(\d+)", address, re.I)
     if box:
-        return bool(re.search(rf"P\.?\s*O\.?\s*Box\s+{box[1]}\b", text, re.I))
+        return re.compile(rf"P\.?\s*O\.?\s*Box\s+{box[1]}\b", re.I)
     match = re.match(r"(\d+)\s+(?:(?:N|S|E|W|North|South|East|West)\.?\s+)?([A-Za-z0-9']+)", address)
-    return bool(match) and bool(re.search(
-        rf"\b{match[1]}\s+(?:(?:N|S|E|W|North|South|East|West)\.?\s+)?{re.escape(match[2])}\b", text, re.I))
+    if not match:
+        return None
+    return re.compile(
+        rf"\b{match[1]}\s+(?:(?:N|S|E|W|North|South|East|West)\.?\s+)?{re.escape(match[2])}\b", re.I)
 
 
-def rank_addresses(result: dict[str, Any], limit: int | None) -> list[dict[str, Any]]:
+def confirms_address(text: str, address: str) -> bool:
+    pattern = address_pattern(address)
+    return bool(pattern and pattern.search(text))
+
+
+def is_key_page(result: dict[str, Any], url: str) -> bool:
+    pages = list(result.get("_pages", {}))
+    return bool(pages and url == pages[0]) or bool(
+        re.search(r"contact|location|office|visit|directions", urlparse(url).path, re.I))
+
+
+def page_presence(result: dict[str, Any], count_text, in_links=lambda page: False) -> tuple[list[str], int]:
+    """(pages the value appears on, total visible mentions)."""
+    pages, mentions = [], 0
+    for url, page in result.get("_pages", {}).items():
+        found = count_text(page["text"])
+        mentions += found
+        if found or in_links(page):
+            pages.append(url)
+    return pages, mentions
+
+
+def grade(result: dict[str, Any], entry: dict[str, Any], pages: list[str], mentions: int,
+          methods: set[str], extra: list[tuple[int, str]]) -> dict[str, Any]:
+    """Attach score, confidence, and reasons to a contact entry."""
+    total_pages = len(result.get("_pages", {})) or 1
+    reasons: list[tuple[int, str]] = []
+    if pages:
+        reasons.append((POINTS["per_page"] * min(len(pages), 5), f"shown on {len(pages)} of {total_pages} pages checked"))
+        if mentions > len(pages):
+            reasons.append((POINTS["extra_mention"] * min(mentions - len(pages), 3),
+                            f"mentioned {mentions} times in all"))
+        if any(is_key_page(result, url) for url in pages):
+            reasons.append((POINTS["key_page"], "on the home page or a contact page"))
+    if methods & STRONG_METHODS:
+        label = "site's structured data" if methods & STRONG_METHODS == {"json_ld"} else "clickable phone/email link"
+        reasons.append((POINTS["strong_source"], label))
+    elif methods & SECTION_METHODS or any(m.endswith("_confirms_provided") for m in methods):
+        reasons.append((POINTS["section_source"], "in an address/contact section or map link"))
+    reasons.extend(extra)
+    score = sum(points for points, _ in reasons)
+    confidence = "high" if score >= HIGH_CONFIDENCE else "medium" if score >= MEDIUM_CONFIDENCE else "low"
+    return {**entry, "score": score, "confidence": confidence, "primary": False,
+            "reasons": [f"{points:+d} {why}" if points else why for points, why in reasons]}
+
+
+def best_row(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    order = ["json_ld", "tel_link", "mailto_link", "tel_link_text", "semantic_address", "map_link"]
+    return min(rows, key=lambda row: order.index(row["method"]) if row["method"] in order else len(order))
+
+
+def grade_addresses(result: dict[str, Any]) -> list[dict[str, Any]]:
     provided_list = provided_addresses(result)
     provided = {address_key(a) for a in provided_list}
+    client_state = clean_text(result["original_fields"]["state"]).upper()
     groups: dict[tuple[str, str], dict[str, Any]] = {}
     for row in result["contacts"]["addresses"]:
-        score = row_score(result, row)
         for address in full_addresses(row["raw"]):
-            group = groups.setdefault(address_key(address), {"row": None, "score": -99, "seen": 0})
-            group["seen"] += row.get("_seen", 1)
-            # Prefer the most trusted source, then the most detailed wording.
-            if (score, len(address)) > (group["score"], len(group["row"]["raw"]) if group["row"] else 0):
-                group["score"] = score
-                group["row"] = {**row, "raw": address, "kind": address_kind(address)}
-    # A site that shows the table's street without a readable city/ZIP still
-    # confirms it; the city/ZIP then come from the table and say so.
-    for address in provided_list:
-        if address_key(address) in groups:
-            continue
-        rows = [row for row in result["contacts"]["addresses"] if confirms_address(row["raw"], address)]
-        if rows:
-            best = max(rows, key=lambda row: row_score(result, row))
-            groups[address_key(address)] = {
-                "row": {**best, "raw": address, "kind": address_kind(address),
-                        "method": f"{best['method']}_confirms_provided"},
-                "score": row_score(result, best), "seen": sum(row.get("_seen", 1) for row in rows)}
-    ranked = sorted(groups.items(), key=lambda item: -(
-        item[1]["score"] + min(item[1]["seen"], 3) + (4 if item[0] in provided else 0)))
-    return [{k: v for k, v in group["row"].items() if k != "_seen"} for _, group in ranked[:limit]]
-
-
-def rank_phones(result: dict[str, Any], limit: int | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Merge numbers written different ways and decide main vs hotline once per number."""
-    provided_main = provided_phone_keys(result["original_fields"]["org_phone"])
-    provided_hotline = provided_phone_keys(result["original_fields"]["hotline_24_7"])
-    groups: dict[tuple[str, str], dict[str, Any]] = {}
-    for bucket in ("phones", "hotlines_24_7"):
-        for row in result["contacts"][bucket]:
-            key = phone_key(row["raw"])
-            if not key:
-                continue
-            group = groups.setdefault(key, {"rows": [], "main": 0, "hotline": 0})
+            group = groups.setdefault(address_key(address), {"rows": [], "best": None})
             group["rows"].append(row)
-            group["hotline" if bucket == "hotlines_24_7" else "main"] += row.get("_seen", 1)
+            # Keep the most detailed wording of the same place.
+            if group["best"] is None or len(address) > len(group["best"]):
+                group["best"] = address
+    # Fix #1: the client's address counts when its street appears anywhere on
+    # a checked page, even outside the contact sections scanned above.
+    for address in provided_list:
+        key = address_key(address)
+        if key in groups:
+            continue
+        pages = [url for url, page in result.get("_pages", {}).items() if confirms_address(page["text"], address)]
+        rows = [row for row in result["contacts"]["addresses"] if confirms_address(row["raw"], address)]
+        if pages or rows:
+            source = rows[0]["source_url"] if rows else pages[0]
+            groups[key] = {"rows": rows or [{"source_url": source, "method": "confirmed_on_page"}], "best": address}
+            groups[key]["rows"][0] = {**groups[key]["rows"][0], "method": (
+                f"{rows[0]['method']}_confirms_provided" if rows else "confirmed_on_page")}
 
-    main, hotlines = [], []
+    graded = []
     for key, group in groups.items():
-        best = max(group["rows"], key=lambda row: row_score(result, row))
-        score = row_score(result, best) + min(group["main"] + group["hotline"], 3)
+        address = group["best"]
+        pattern = address_pattern(address)
+        pages, mentions = page_presence(result, lambda text: len(pattern.findall(text)) if pattern else 0)
+        extra = []
+        if key in provided:
+            extra.append((POINTS["client_match"], "matches the client's list"))
+        state = re.search(r",\s*([A-Z]{2})\s+\d{5}", address)
+        if client_state in US_STATES and state:
+            if state[1] == client_state:
+                extra.append((POINTS["same_state"], f"in the client's state ({client_state})"))
+            else:
+                extra.append((POINTS["other_state"], f"outside the client's state ({state[1]})"))
+        row = best_row(group["rows"])
+        entry = {"raw": address, "kind": address_kind(address),
+                 "source_url": row["source_url"], "method": row["method"]}
+        graded.append(grade(result, entry, pages, mentions, {r["method"] for r in group["rows"]}, extra))
+    graded.sort(key=lambda entry: -entry["score"])
+    # A street address people can visit beats a PO Box unless it is a weak match.
+    primary = next((e for e in graded if e["kind"] == "physical" and e["confidence"] != "low"), None)
+    if graded:
+        (primary or graded[0])["primary"] = True
+    return graded
+
+
+def grade_phones(result: dict[str, Any]) -> list[dict[str, Any]]:
+    provided = provided_phone_keys(result["original_fields"]["org_phone"])
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in result["contacts"]["phones"]:
+        key = phone_key(row["raw"])
+        if key:
+            group = groups.setdefault(key, {"rows": [], "hotline": False})
+            group["rows"].append(row)
+            group["hotline"] |= bool(row.get("labeled_hotline"))
+    # Fix #1: the client's number counts when it appears anywhere on a page.
+    for digits in provided:
+        key = (digits, "")
+        if key not in groups:
+            pages = [url for url, page in result.get("_pages", {}).items() if phone_pattern(digits).search(page["text"])]
+            if pages:
+                groups[key] = {"rows": [{"source_url": pages[0], "method": "confirmed_on_page"}], "hotline": False}
+
+    graded = []
+    for key, group in groups.items():
         digits = key[0]
-        if digits in provided_main or digits in provided_hotline:
-            score += 4  # still published on the site, so the table value is confirmed
-        # The source table settles which list a known number belongs in.
-        if digits in provided_hotline and digits in provided_main:
-            kinds = ("main", "hotline")
-        elif digits in provided_hotline:
-            kinds = ("hotline",)
-        elif digits in provided_main:
-            kinds = ("main",)
-        else:
-            kinds = ("hotline",) if group["hotline"] >= group["main"] else ("main",)
-        for kind in kinds:
-            entry = {"raw": format_phone(key), "normalized": f"+1{digits}", "kind": kind,
-                     "source_url": best["source_url"], "method": best["method"]}
-            (hotlines if kind == "hotline" else main).append((score, entry))
-    order = lambda pairs: [entry for _, entry in sorted(pairs, key=lambda pair: -pair[0])[:limit]]
-    return order(main), order(hotlines)
+        pattern = phone_pattern(digits)
+        pages, mentions = page_presence(result, lambda text: len(pattern.findall(text)),
+                                        lambda page: digits in page["tel"])
+        methods = {row["method"] for row in group["rows"]}
+        extra = []
+        if digits in provided:
+            extra.append((POINTS["client_match"], "matches the client's list"))
+        elif digits in NATIONAL_HOTLINES:
+            extra.append((POINTS["national_hotline"], f"{NATIONAL_HOTLINES[digits]}, not this organization's own line"))
+        if methods == {"tel_link_hidden"}:
+            extra.append((POINTS["hidden_link"], "only inside a phone link that shows a different number"))
+        if group["hotline"]:
+            extra.append((0, "labeled on the site as a hotline/24-7/crisis line"))
+        row = best_row(group["rows"])
+        entry = {"raw": format_phone(key), "normalized": f"+1{digits}", "labeled_hotline": group["hotline"],
+                 "source_url": row["source_url"], "method": row["method"]}
+        graded.append(grade(result, entry, pages, mentions, methods - {"tel_link_hidden"}, extra))
+    graded.sort(key=lambda entry: -entry["score"])
+    if graded:
+        graded[0]["primary"] = True
+    return graded
 
 
-def rank_emails(result: dict[str, Any], limit: int | None) -> list[dict[str, Any]]:
+def grade_emails(result: dict[str, Any]) -> list[dict[str, Any]]:
     label = normalized_host(result["original_fields"]["website_url"]).split(".")[0]
     provided = clean_text(result["original_fields"]["org_email"]).lower()
-    scored = []
+    rows_by_email: dict[str, list[dict[str, Any]]] = {}
     for row in result["contacts"]["emails"]:
-        email = row["value"]
-        if email_rejected(result, email):
-            continue
+        if not email_rejected(result, row["value"]):
+            rows_by_email.setdefault(row["value"], []).append(row)
+    # Fix #1: the client's email counts when it appears anywhere on a page.
+    if EMAIL_RE.fullmatch(provided or "-") and provided not in rows_by_email:
+        pages = [url for url, page in result.get("_pages", {}).items()
+                 if provided in page["text"].lower() or provided in page["mailto"]]
+        if pages:
+            rows_by_email[provided] = [{"source_url": pages[0], "method": "confirmed_on_page"}]
+
+    graded = []
+    for email, rows in rows_by_email.items():
         local, _, domain = email.partition("@")
-        score = row_score(result, row) + min(row.get("_seen", 1), 3)
-        score += 3 if label in domain.split(".") else 0
-        score += 2 if ROLE_EMAIL_RE.match(local) else 0
-        score += 4 if email == provided else 0
-        scored.append((score, {k: v for k, v in row.items() if k != "_seen"}))
-    return [row for _, row in sorted(scored, key=lambda pair: -pair[0])[:limit]]
+        pages, mentions = page_presence(result, lambda text: text.lower().count(email),
+                                        lambda page: email in page["mailto"])
+        extra = []
+        if email == provided:
+            extra.append((POINTS["client_match"], "matches the client's list"))
+        if label in domain.split("."):
+            extra.append((POINTS["own_domain"], "on the organization's own website domain"))
+        if SPECIAL_EMAIL_RE.search(local):
+            extra.append((POINTS["special_inbox"], "special-purpose inbox (web admin, volunteer, donations, ...)"))
+        elif ROLE_EMAIL_RE.match(local):
+            extra.append((POINTS["general_inbox"], "general inbox"))
+        row = best_row(rows)
+        entry = {"value": email, "source_url": row["source_url"], "method": row["method"]}
+        graded.append(grade(result, entry, pages, mentions, {r["method"] for r in rows}, extra))
+    graded.sort(key=lambda entry: -entry["score"])
+    if graded:
+        graded[0]["primary"] = True
+    return graded
+
+
+def contact_review_reasons(result: dict[str, Any]) -> list[str]:
+    """Plain-language reasons a person should look at the primary contacts."""
+    original, contacts, reasons = result["original_fields"], result["contacts"], []
+    checks = [
+        ("phone", contacts["phones"], "raw", provided_phone_keys(original["org_phone"]),
+         lambda entry: entry["normalized"][2:]),
+        ("email", contacts["emails"], "value", {clean_text(original["org_email"]).lower()} - {""},
+         lambda entry: entry["value"]),
+        ("address", contacts["addresses"], "raw", {address_key(a) for a in provided_addresses(result)},
+         lambda entry: address_key(entry["raw"])),
+    ]
+    for label, entries, key, client_values, compare in checks:
+        primary = next((entry for entry in entries if entry.get("primary")), None)
+        if not primary:
+            continue
+        if primary["confidence"] == "low":
+            reasons.append(f"Primary {label} {primary[key]} has low confidence (score {primary['score']}).")
+        if client_values and compare(primary) not in client_values:
+            reasons.append(f"Primary {label} {primary[key]} differs from the client's list.")
+    return reasons
 
 
 def tidy_contacts(result: dict[str, Any], limit: int | None) -> None:
-    """Replace raw contact lists with validated, de-duplicated, ranked ones."""
+    """Replace raw contact lists with validated, merged, graded ones."""
     contacts = result["contacts"]
-    before = {
-        "addresses": len(contacts["addresses"]),
-        "phone numbers": len(contacts["phones"]) + len(contacts["hotlines_24_7"]),
-        "email addresses": len(contacts["emails"]),
-        "map links": len(contacts["map_links"]),
-    }
-    contacts["addresses"] = rank_addresses(result, limit)
-    contacts["phones"], contacts["hotlines_24_7"] = rank_phones(result, limit)
-    contacts["emails"] = rank_emails(result, limit)
+    contacts["addresses"] = grade_addresses(result)[:limit]
+    contacts["phones"] = grade_phones(result)[:limit]
+    contacts["emails"] = grade_emails(result)[:limit]
     contacts["map_links"] = [{k: v for k, v in row.items() if k != "_seen"}
-                             for row in contacts["map_links"][:limit]]
-    after = {
-        "addresses": len(contacts["addresses"]),
-        "phone numbers": len({row["normalized"] for row in contacts["phones"] + contacts["hotlines_24_7"]}),
-        "email addresses": len(contacts["emails"]),
-        "map links": len(contacts["map_links"]),
-    }
-    for label, count in before.items():
-        if after[label] < count:
-            result["extraction"]["notes"].append(
-                f"Kept {after[label]} of {count} {label} found; the rest were duplicates, "
-                "incomplete, or lower ranked."
-            )
+                             for row in contacts["map_links"]][:limit]
+    result["extraction"]["contact_review"] = contact_review_reasons(result)
+    result.pop("_pages", None)
+
+
+def nearby_text(anchor: Any) -> str:
+    """The link's own block plus the text just before it, e.g. "Call our 24/7 line:"."""
+    before = []
+    for piece in anchor.find_all_previous(string=True, limit=12):
+        if piece.parent.name in ("script", "style"):
+            continue
+        before.append(clean_text(piece))
+        if sum(map(len, before)) > 100:
+            break
+    return clean_text(f"{' '.join(reversed(before))} {link_text(anchor.parent)}")
 
 
 def link_text(link: Any) -> str:
@@ -1137,8 +1272,20 @@ def extract_from_page(result: dict[str, Any], soup: Any, page_url: str) -> list[
     for anchor in soup.select('a[href^="tel:"]'):
         href = clean_text(anchor.get("href"))
         value = unquote(href[4:]).split("?", 1)[0]
-        context = f"{link_text(anchor.parent)} {link_text(anchor)}"
-        add_phone(result, value, page_url, "tel_link", context)
+        context = nearby_text(anchor)
+        dialed = phone_key(value)
+        shown = [match.group(0) for match in PHONE_RE.finditer(link_text(anchor))]
+        if dialed and shown and dialed[0] not in {key[0] for key in map(phone_key, shown) if key}:
+            # The link shows one number but dials another (an outdated link).
+            # Visitors read the shown number, so it is graded normally and the
+            # dialed one is penalized.
+            for number in shown:
+                add_phone(result, number, page_url, "tel_link_text", context)
+            add_phone(result, value, page_url, "tel_link_hidden", context)
+            result["extraction"]["notes"].append(
+                f"{page_url}: a phone link shows {', '.join(shown)} but dials {format_phone(dialed)}.")
+        else:
+            add_phone(result, value, page_url, "tel_link", context)
 
     for anchor in soup.select('a[href^="mailto:"]'):
         href = clean_text(anchor.get("href"))
@@ -1195,7 +1342,8 @@ def extract_from_page(result: dict[str, Any], soup: Any, page_url: str) -> list[
         for match in ADDRESS_RE.finditer(container_text):
             add_address(result, match.group(0), page_url, "contact_container_text")
         for match in PHONE_RE.finditer(container_text):
-            nearby = container_text[max(0, match.start() - 80) : match.end() + 80]
+            # Labels such as "24/7 crisis line:" come just before the number.
+            nearby = container_text[max(0, match.start() - 60) : match.end()]
             add_phone(result, match.group(0), page_url, "contact_container_text", nearby)
         for email in EMAIL_RE.findall(container_text):
             add_email(result, email, page_url, "contact_container_text")
@@ -1210,7 +1358,7 @@ def set_result_status(result: dict[str, Any]) -> None:
     core_fields_found = sum(
         (
             bool(contacts["addresses"]),
-            bool(contacts["phones"] or contacts["hotlines_24_7"]),
+            bool(contacts["phones"]),
             bool(contacts["emails"]),
         )
     )
@@ -1409,6 +1557,7 @@ def scrape_one_site(fetch: Any, item: dict[str, Any]) -> dict[str, Any]:
                     result["extraction"]["errors"].append({"source_url": page_url, "message": message})
                 continue
             result["extraction"]["pages_checked"].append(page_url)
+            record_page(result, soup, page_url)
             candidates = extract_from_page(result, soup, page_url)
             for candidate in profile_pages(soup, page_url, item["website_url"]):
                 if candidate not in visited and candidate not in profile_queue:
@@ -1423,10 +1572,9 @@ def scrape_one_site(fetch: Any, item: dict[str, Any]) -> dict[str, Any]:
                 {"source_url": page_url, "message": f"{type(exc).__name__}: {clean_text(exc)[:240]}"}
             )
 
-    max_per_type = item.get("max_per_type", 3) or None
-    tidy_contacts(result, max_per_type)
+    tidy_contacts(result, item.get("max_per_type") or None)
     set_result_status(result)
-    finalize(result, max_per_type)
+    finalize(result, max_values=3)  # profile candidates (descriptions etc.)
     return result
 
 
@@ -1541,7 +1689,7 @@ def run_live_scrape(
     items: list[dict[str, Any]], max_contact_pages: int, delay_seconds: float, headless: bool,
     max_profile_pages: int = 2, workers: int = 4, fetch_mode: str = "browser",
     http_workers: int = 16, page_timeout: float = 30.0, chrome_path: str | None = None,
-    max_per_type: int = 3,
+    max_per_type: int = 0,
 ) -> list[dict[str, Any]]:
     """Run the live scrape.
 
@@ -1645,21 +1793,9 @@ def parse_args() -> argparse.Namespace:
         help="Path to the Chrome/Chromium executable if Botasaurus cannot find it.",
     )
     parser.add_argument(
-        "--max-per-contact-type", type=int, default=3,
-        help="Keep the best N addresses, phones, hotlines, and emails per organization after "
-             "removing duplicates and invalid values; 0 keeps all of them (default: 3).",
-    )
-    parser.add_argument(
-        "--skip-irs", action="store_true",
-        help="Do not add IRS status fields (irs_status, irs_last_checked, irs_details).",
-    )
-    parser.add_argument(
-        "--irs-cache-dir", default="irs_data",
-        help="Where IRS bulk files are cached between runs (default: irs_data).",
-    )
-    parser.add_argument(
-        "--irs-max-age-hours", type=float, default=24.0,
-        help="Reuse cached IRS files younger than this without contacting the IRS (default: 24).",
+        "--max-per-contact-type", type=int, default=0,
+        help="Keep only the N best-graded addresses, phones, and emails per organization; "
+             "0 keeps every valid one with its score (default: 0).",
     )
     parser.add_argument(
         "--limit",
@@ -1693,14 +1829,6 @@ def main() -> None:
         items = items[: args.limit]
 
     started = time.monotonic()
-    irs_loader = None
-    if not args.export_targets and not args.skip_irs:
-        # Download/refresh the IRS files while the websites are being scraped.
-        from irs_status import load_irs_data
-
-        irs_loader = ThreadPoolExecutor(max_workers=1)
-        irs_future = irs_loader.submit(load_irs_data, Path(args.irs_cache_dir), args.irs_max_age_hours)
-
     if args.export_targets:
         records = items
         mode = "target list"
@@ -1722,16 +1850,6 @@ def main() -> None:
             max_per_type=args.max_per_contact_type,
         )
         mode = "live scrape"
-
-    if irs_loader:
-        from irs_status import apply_irs_status, summarize
-
-        irs_data, irs_error = irs_future.result()
-        irs_loader.shutdown()
-        if irs_error:
-            print(f"WARNING: IRS check skipped ({irs_error}); irs_status is 'not_checked'.")
-        apply_irs_status(records, irs_data, irs_error)
-        print(f"IRS status: {summarize(records)}")
 
     write_json(output_path, records)
     print(f"Wrote {len(records)} {mode} records to {output_path} in {time.monotonic() - started:.0f}s")

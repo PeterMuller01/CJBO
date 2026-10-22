@@ -8,8 +8,8 @@ the same data as a full browser run before switching to it:
     python scrape_charity_contacts.py --fetch-mode auto --output run_auto.json
     python compare_outputs.py run_browser.json run_auto.json
 
-Timestamps, IRS fields, and the fetch method are ignored because they are
-expected to differ between runs.
+Timestamps and the fetch method are ignored because they are expected to
+differ between runs.
 """
 
 from __future__ import annotations
@@ -19,11 +19,11 @@ import json
 from pathlib import Path
 from typing import Any
 
-IGNORED_TOP_LEVEL = {"scraped_at", "last_checked", "irs_status", "irs_last_checked", "irs_details"}
+IGNORED_TOP_LEVEL = {"scraped_at", "last_checked"}
 FLAT_FIELDS = (
-    "org_name", "org_type", "category", "org_description", "area_served", "website_url",
-    "org_phone", "hotline_24_7", "org_email", "street_address", "city", "state", "zip",
-    "ein", "is_active", "org_notes",
+    "org_name", "category", "org_description", "website_url",
+    "org_phone", "org_email", "street_address", "city", "state", "zip",
+    "ein", "is_active",
 )
 
 
