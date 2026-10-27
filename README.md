@@ -1,14 +1,10 @@
 # Charity contact scraper
 
-This package turns the 58 organization websites in the supplied table into a
-reviewable JSON file for the CJB Outreach Finding Charity database. For each
+This package turns the 58 organization websites in the target list into two
+JSON files for the CJB Outreach Finding Charity database. For each
 organization it collects public phone numbers, email addresses,
 mailing/physical addresses, and a contact-form URL when one is found, grades
 every value, and puts the best one of each into the main database fields.
-
-Every output record also keeps the original organization fields from the
-table (ID, name, category, description, website URL, contact fields, address
-fields, EIN, active status, and last-checked date) under `original_fields`.
 
 The scraper does not try to defeat protections or infer missing data. It
 checks the supplied page and at most two same-domain Contact/Location pages,
@@ -37,11 +33,34 @@ python -m pip install -r requirements.txt
 python scrape_charity_contacts.py --input charity_scrape_targets.json --output charity_contacts_live.json
 ```
 
-The result is a JSON array with one record per organization. The main fields
-are `org_name`, `category`, `org_description`, `website_url`, `org_phone`,
-`org_email`, `street_address`, `city`, `state`, `zip`, `ein`, `is_active`, and
-`last_checked`. Every graded value is under `contacts.phones`,
-`contacts.addresses`, and `contacts.emails`.
+This writes two files, each a JSON array with one record per organization in
+the same order:
+
+- `charity_contacts_live.json` (`--output`): only the database fields, for
+  the Power Automate import: `org_id`, `org_name`, `category`,
+  `org_description`, `website_url`, `org_phone`, `org_email`,
+  `street_address`, `city`, `state`, `zip`, `is_active`, and `last_checked`.
+- `Charity_Contacts_metadata.json` (`--metadata-output`, saved next to the
+  main file by default): everything else, matched by `org_id` and `org_name`.
+  It has every graded value (`contacts.phones`, `contacts.addresses`,
+  `contacts.emails`), the scrape status and review notes (`extraction`), the
+  description/category values found on the website (`organization_details`),
+  where each main field came from (`field_sources`), and the target file's
+  values (`original_fields`).
+
+### Where the main fields come from
+
+- `org_id`, `org_name`, and `website_url` always come from the target file;
+  they are never taken from the website.
+- `org_description` and `category` use the target file's value when it has
+  one. If the target leaves them blank, the best value found on the website is
+  used (a category guessed from the site's wording is flagged with
+  `extraction.profile_review_required`). Either way, the values found on the
+  website are kept in the metadata file under `organization_details`.
+- Phone, email, and address fields use the top-graded website value (see
+  "How contacts are graded"); if nothing valid is found, the target file's
+  value is kept.
+- `is_active` and `last_checked` come from the scrape itself (see below).
 
 For a small first test, add `--limit 3`. If a site behaves differently in
 headless Chrome, retry with `--show-browser`; do not try to bypass a site's
@@ -141,10 +160,6 @@ note catches those cases.
 Use `--max-per-contact-type N` to keep a different number of entries of each
 type (`0` keeps every valid one).
 
-Profile fields follow the same idea: a rule-based guess (such as an inferred
-category) only fills a field the source table left blank, and differently
-worded descriptions are not counted as conflicts.
-
 ## Speed options
 
 The scraper runs several sites at the same time. Each site is still crawled
@@ -169,21 +184,24 @@ sites only reveal email addresses with JavaScript, so compare once on the real
 sites before relying on it:
 
 ```bash
-python scrape_charity_contacts.py --output run_browser.json
-python scrape_charity_contacts.py --fetch-mode auto --output run_auto.json
+python scrape_charity_contacts.py --output run_browser.json --metadata-output run_browser_meta.json
+python scrape_charity_contacts.py --fetch-mode auto --output run_auto.json --metadata-output run_auto_meta.json
 python compare_outputs.py run_browser.json run_auto.json
+python compare_outputs.py run_browser_meta.json run_auto_meta.json
 ```
 
-`extraction.fetch_method` in each record says whether it came from `http` or
-`browser`.
+`extraction.fetch_method` in each metadata record says whether it came from
+`http` or `browser`.
 
 ## Rebuild the included JSON files
 
-If you have the original Markdown table in the same folder, run:
+If you have the original Markdown table in the same folder, run the commands
+below. Give `--inventory-only` its own `--metadata-output`, so it does not
+replace the live scrape's `Charity_Contacts_metadata.json`.
 
 ```bash
 python scrape_charity_contacts.py --input "Pasted markdown(2).md" --export-targets --output charity_scrape_targets.json
-python scrape_charity_contacts.py --input "Pasted markdown(2).md" --inventory-only --output charity_contact_inventory.json
+python scrape_charity_contacts.py --input "Pasted markdown(2).md" --inventory-only --output charity_contact_inventory.json --metadata-output charity_contact_inventory_metadata.json
 ```
 
 Use `--max-contact-pages 1` to reduce the crawl to the supplied page plus one

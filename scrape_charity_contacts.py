@@ -96,7 +96,10 @@ EMAIL_RE = re.compile(
 )
 
 
-FIELDS = ('org_name', 'category', 'org_description', 'website_url', 'ein')
+# org_id, org_name, and website_url always come from the target file.  These
+# profile fields come from the target file too, unless it leaves them blank;
+# then the best value found on the website is used.
+FIELDS = ('category', 'org_description')
 PROFILE_WORDS = ('about', 'mission', 'who we are', 'services', 'service area', 'where we serve')
 
 
@@ -121,19 +124,13 @@ def add(result, field, value, url, method, priority=50):
 def initialize(result):
     result['organization_details'] = {field: [] for field in FIELDS}
     result['original_fields'] = {k: result[k] for k in (
-        *FIELDS, 'org_phone', 'org_email', 'street_address',
+        'org_name', 'website_url', *FIELDS, 'org_phone', 'org_email', 'street_address',
         'city', 'state', 'zip', 'is_active', 'last_checked')}
     result['field_sources'] = {
         field: dict(value=value, source_url=None,
                     method='provided_inventory' if value else 'not_found')
         for field, value in result['original_fields'].items()
     }
-
-
-def ein(value):
-    value = text(value)
-    match = re.fullmatch(r'(\d{2})-?(\d{7})', value)
-    return f'{match[1]}-{match[2]}' if match else None
 
 
 def place_names(value):
@@ -146,44 +143,18 @@ def place_names(value):
 
 def structured(result, obj, url):
     """Caller has already matched this entity to the target organization."""
-    for field, key in [('org_name', 'name'), ('org_description', 'description'),
-                       ('category', 'category')]:
+    for field, key in [('org_description', 'description'), ('category', 'category')]:
         value = place_names(obj.get(key))
         add(result, field, value[:600] if field == 'org_description' else value,
             url, 'matched_json_ld', 100)
-    for key in ('taxID', 'taxId'):
-        value = ein(obj.get(key))
-        if value:
-            add(result, 'ein', value, url, 'matched_json_ld_tax_id', 100)
-    identifiers = obj.get('identifier', [])
-    for value in identifiers if isinstance(identifiers, list) else [identifiers]:
-        if isinstance(value, dict) and re.search(r'\bEIN\b|employer identification', text(value.get('propertyID') or value.get('name')), re.I):
-            add(result, 'ein', ein(value.get('value')), url, 'matched_json_ld_ein', 100)
-    website = obj.get('url')
-    if isinstance(website, str) and host(website) == host(result['original_fields']['website_url']):
-        add(result, 'website_url', website, url, 'matched_json_ld', 100)
 
 
 def extract(result, soup, url):
-    root = result['original_fields']['website_url']
     is_home = urlparse(url).path.rstrip('/') == ''
-    # Organization branding is safer than arbitrary page headings/titles.
-    branding = soup.select_one('meta[property="og:site_name"]')
-    if branding:
-        value = text(branding.get('content'))
-        seed = text(result['original_fields']['org_name']).casefold()
-        words = set(re.findall(r'[a-z0-9]{4,}', seed))
-        if not seed or value.casefold() in seed or seed in value.casefold() or len(words & set(re.findall(r'[a-z0-9]{4,}', value.casefold()))) >= 2:
-            add(result, 'org_name', value, url, 'site_name_meta', 70)
     if is_home:
         description = soup.select_one('meta[name="description"], meta[property="og:description"]')
         if description:
             add(result, 'org_description', text(description.get('content'))[:600], url, 'homepage_description', 70)
-    canonical = soup.select_one('link[rel="canonical"]')
-    if is_home and canonical:
-        value = urljoin(url, text(canonical.get('href')))
-        if host(value) == host(root):
-            add(result, 'website_url', value, url, 'homepage_canonical', 80)
     # Restrict statements to readable paragraphs and small footer blocks.
     blocks = []
     for element in soup.select('main p, article p, [class*="about"] p, [class*="mission"] p, footer p, footer small, footer'):
@@ -208,11 +179,6 @@ def extract(result, soup, url):
             mission_blocks.append(block)
             if len(block) >= 40:
                 add(result, 'org_description', block[:600], url, 'self_description_text', 60)
-        # EIN needs a tax label; never take an arbitrary nine-digit number.
-        # A block naming a different entity is still a reviewable candidate.
-        match = re.search(r'\b(?:EIN|employer identification number|federal tax (?:ID|identification)(?: number)?)\s*[:#-]?\s*(\d{2}-?\d{7})\b', block, re.I)
-        if match and (self_statement or mission or re.match(r'^(?:our\s+)?(?:EIN|employer identification|federal tax)', block, re.I)):
-            add(result, 'ein', ein(match[1]), url, 'labeled_tax_id_text', 70)
     # Category classification is explicitly tagged as a rule-based inference.
     rules = [
         ('Domestic Violence / Sexual Assault', r'domestic violence|sexual (?:assault|violence)|intimate partner violence'),
@@ -254,25 +220,17 @@ def source_of(row, key):
             **{k: row[k] for k in ('score', 'confidence') if k in row}}
 
 
-# Rule-based guesses (priority below this) only fill fields the table left blank.
-WEAK_PRIORITY = 50
 # Sites word their own description several ways, so that is not a conflict.
 CONFLICT_FIELDS = tuple(field for field in FIELDS if field != 'org_description')
 
 
-def comparable(field, value):
-    if field == 'website_url':
-        return f"{host(value)}{urlparse(value).path.rstrip('/').lower()}"
+def comparable(value):
     words = re.findall(r'[a-z0-9]+', re.sub(r"['’]", '', value.casefold()))
     return ' '.join(word for word in words if word not in {'inc', 'the', 'of', 'and'})
 
 
-def has_conflict(field, rows):
-    keys = {comparable(field, row['value']) for row in rows} - {''}
-    if field == 'org_name':
-        # "Beyond Abuse" and "Surviving Child Abuse | Beyond Abuse" agree.
-        keys = {key for key in keys if not any(key != other and f' {key} ' in f' {other} ' for other in keys)}
-    return len(keys) > 1
+def has_conflict(rows):
+    return len({comparable(row['value']) for row in rows} - {''}) > 1
 
 
 def finalize(result, max_values=None):
@@ -280,9 +238,10 @@ def finalize(result, max_values=None):
     for field in FIELDS:
         baseline = result['original_fields'][field]
         candidates = result['organization_details'][field]
-        usable = [row for row in candidates if row['priority'] >= WEAK_PRIORITY or not usable_value(baseline)]
-        if usable:
-            chosen = max(usable, key=lambda row: row['priority'])
+        if candidates and not usable_value(baseline):
+            # The target file left this blank, so use the best website value.
+            # Website values always stay in organization_details for review.
+            chosen = max(candidates, key=lambda row: row['priority'])
             result[field] = chosen['value']
             result['field_sources'][field] = {k: v for k, v in chosen.items() if k != 'priority'}
         else:
@@ -329,7 +288,7 @@ def finalize(result, max_values=None):
     result['extraction']['profile_review_required'] = any(
         row['method'].startswith('inferred') for row in result['field_sources'].values())
     result['extraction']['profile_conflicts'] = [
-        field for field in CONFLICT_FIELDS if has_conflict(field, result['organization_details'][field])]
+        field for field in CONFLICT_FIELDS if has_conflict(result['organization_details'][field])]
     if result['extraction']['profile_conflicts']:
         result['extraction']['profile_review_required'] = True
     if max_values:
@@ -482,7 +441,6 @@ def new_result(item: dict[str, Any], data_origin: str) -> dict[str, Any]:
         "city": item["city"],
         "state": item["state"],
         "zip": item["zip"],
-        "ein": item.get("ein", ""),
         "is_active": item["is_active"],
         "last_checked": item["last_checked"],
         "scraped_at": utc_now() if data_origin == "live_scrape" else None,
@@ -1720,6 +1678,32 @@ def write_json(path: Path, records: list[dict[str, Any]]) -> None:
     path.write_text(json.dumps(records, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+# Only these fields go into the organization import file, in this order.
+ORGANIZATION_OUTPUT_FIELDS = (
+    "org_id", "org_name", "category", "org_description", "website_url",
+    "org_phone", "org_email", "street_address", "city", "state", "zip",
+    "is_active", "last_checked",
+)
+
+
+def split_records(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Separate import fields from contacts/evidence without dropping any data.
+
+    IDs and names are repeated in metadata so rows can be matched even when
+    an input organization has a blank ID. Array order is also preserved.
+    """
+    organizations = []
+    metadata = []
+    for record in records:
+        organizations.append({field: record.get(field, "") for field in ORGANIZATION_OUTPUT_FIELDS})
+        metadata.append({
+            "org_id": record.get("org_id", ""),
+            "org_name": record.get("org_name", ""),
+            **{key: value for key, value in record.items() if key not in ORGANIZATION_OUTPUT_FIELDS},
+        })
+    return organizations, metadata
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Extract public charity profiles and contact details into reviewable JSON."
@@ -1732,7 +1716,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         default="charity_contacts_live.json",
-        help="JSON output path.",
+        help="Organization JSON output path (target list path with --export-targets).",
+    )
+    parser.add_argument(
+        "--metadata-output",
+        default=None,
+        help="Contact/review JSON path (default: Charity_Contacts_metadata.json beside --output). "
+             "Not used with --export-targets.",
     )
     parser.add_argument(
         "--inventory-only",
@@ -1810,6 +1800,13 @@ def parse_args() -> argparse.Namespace:
         parser.error("--page-timeout must be positive.")
     if args.inventory_only and args.export_targets:
         parser.error("Choose either --inventory-only or --export-targets, not both.")
+    if not args.export_targets:
+        metadata_path = Path(args.metadata_output) if args.metadata_output else Path(args.output).with_name("Charity_Contacts_metadata.json")
+        protected_paths = {Path(args.input).resolve(), Path(args.output).resolve()}
+        if metadata_path.resolve() in protected_paths:
+            parser.error("The metadata output must differ from the input and organization output paths.")
+        if Path(args.input).resolve() == Path(args.output).resolve():
+            parser.error("The organization output must differ from the input path.")
     return args
 
 
@@ -1847,7 +1844,15 @@ def main() -> None:
         )
         mode = "live scrape"
 
-    write_json(output_path, records)
+    if args.export_targets:
+        write_json(output_path, records)
+    else:
+        metadata_path = (Path(args.metadata_output) if args.metadata_output
+                         else output_path.with_name("Charity_Contacts_metadata.json"))
+        organizations, metadata = split_records(records)
+        write_json(output_path, organizations)
+        write_json(metadata_path, metadata)
+        print(f"Wrote {len(metadata)} contact/metadata records to {metadata_path}")
     print(f"Wrote {len(records)} {mode} records to {output_path} in {time.monotonic() - started:.0f}s")
 
 

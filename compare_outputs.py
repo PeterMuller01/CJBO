@@ -2,11 +2,13 @@
 """Compare two scraper output files record by record.
 
 Use it to check that a faster mode (for example ``--fetch-mode auto``) finds
-the same data as a full browser run before switching to it:
+the same data as a full browser run before switching to it.  It works on
+either the organization files or the metadata files:
 
-    python scrape_charity_contacts.py --output run_browser.json
-    python scrape_charity_contacts.py --fetch-mode auto --output run_auto.json
+    python scrape_charity_contacts.py --output run_browser.json --metadata-output run_browser_meta.json
+    python scrape_charity_contacts.py --fetch-mode auto --output run_auto.json --metadata-output run_auto_meta.json
     python compare_outputs.py run_browser.json run_auto.json
+    python compare_outputs.py run_browser_meta.json run_auto_meta.json
 
 Timestamps and the fetch method are ignored because they are expected to
 differ between runs.
@@ -23,7 +25,7 @@ IGNORED_TOP_LEVEL = {"scraped_at", "last_checked"}
 FLAT_FIELDS = (
     "org_name", "category", "org_description", "website_url",
     "org_phone", "org_email", "street_address", "city", "state", "zip",
-    "ein", "is_active",
+    "is_active",
 )
 
 
@@ -56,8 +58,10 @@ def main() -> None:
             continue
         differing += 1
         flat = [field for field in FLAT_FIELDS if a.get(field) != b.get(field)]
-        contacts = [key for key in a["contacts"] if a["contacts"].get(key) != b["contacts"].get(key)]
-        status = (a["extraction"]["status"], b["extraction"]["status"])
+        # Organization files have no contacts/extraction; metadata files do.
+        contacts_a, contacts_b = a.get("contacts", {}), b.get("contacts", {})
+        contacts = [key for key in contacts_a if contacts_a.get(key) != contacts_b.get(key)]
+        status = (a.get("extraction", {}).get("status"), b.get("extraction", {}).get("status"))
         print(f"{org_id} {first[org_id]['org_name']}")
         if status[0] != status[1]:
             print(f"    status: {status[0]} -> {status[1]}")
