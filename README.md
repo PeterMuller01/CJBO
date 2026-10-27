@@ -20,7 +20,11 @@ their shelter locations are confidential.
 
 - `scrape_charity_contacts.py`: the Botasaurus scraper and JSON converter.
 - `compare_outputs.py`: compares two output files record by record.
-- `charity_scrape_targets.json`: the cleaned 58-site input list.
+- `charity_scrape_targets.json`: the 58-site input list. Each entry has only
+  `org_id`, `org_name`, `category`, `org_description`, `website_url`,
+  `is_active`, `org_phone`, `org_email`, `street_address`, `city`, `state`,
+  `zip`, and `last_checked`. To add an organization, add an entry with these
+  fields (at least `org_id`, `org_name`, and `website_url`).
 - `charity_contact_inventory.json`: the existing contact values from the
   supplied table, converted to JSON. This is not a fresh web scrape.
 

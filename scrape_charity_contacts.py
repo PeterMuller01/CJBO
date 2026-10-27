@@ -414,35 +414,24 @@ def parse_markdown_table(path: Path) -> list[dict[str, str]]:
     return records
 
 
+# The scraper input (charity_scrape_targets.json) holds only these fields.
+TARGET_FIELDS = (
+    "org_id", "org_name", "category", "org_description", "website_url", "is_active",
+    "org_phone", "org_email", "street_address", "city", "state", "zip", "last_checked",
+)
+
+
 def source_item(record: dict[str, Any]) -> dict[str, Any]:
-    """Convert a source row into the small, portable scraper input format."""
-    existing = record.get("source_fields") or {}
-    return {
-        "org_id": clean_text(record.get("org_id")),
-        "org_name": clean_text(
-            record.get("organization_name") or record.get("org_name")
-        ),
-        "category": clean_text(record.get("category")),
-        "org_description": clean_text(record.get("org_description")),
-        "website_url": markdown_url(
-            record.get("source_url") or record.get("website_url")
-        ),
-        "ein": clean_text(record.get("ein")),
-        "is_active": clean_text(record.get("is_active")),
-        "source_fields": {
-            "org_phone": clean_text(existing.get("org_phone", record.get("org_phone"))),
-            "org_email": clean_text(existing.get("org_email", record.get("org_email"))),
-            "street_address": clean_text(
-                existing.get("street_address", record.get("street_address"))
-            ),
-            "city": clean_text(existing.get("city", record.get("city"))),
-            "state": clean_text(existing.get("state", record.get("state"))),
-            "zip": clean_text(existing.get("zip", record.get("zip"))),
-            "last_checked": clean_text(
-                existing.get("last_checked", record.get("last_checked"))
-            ),
-        },
-    }
+    """Convert a source row into the small, flat scraper input format.
+
+    Also accepts Markdown-table rows and older target files that kept the
+    contact fields under "source_fields".
+    """
+    nested = record.get("source_fields") or {}
+    item = {field: clean_text(nested.get(field, record.get(field))) for field in TARGET_FIELDS}
+    item["org_name"] = clean_text(record.get("organization_name") or record.get("org_name"))
+    item["website_url"] = markdown_url(record.get("source_url") or record.get("website_url"))
+    return item
 
 
 def load_items(path: Path) -> list[dict[str, Any]]:
@@ -481,22 +470,21 @@ def phone_kind(context: str) -> str:
 
 
 def new_result(item: dict[str, Any], data_origin: str) -> dict[str, Any]:
-    fields = item["source_fields"]
     result = {
         "org_id": item["org_id"],
         "org_name": item["org_name"],
         "category": item["category"],
         "org_description": item["org_description"],
         "website_url": item["website_url"],
-        "org_phone": fields["org_phone"],
-        "org_email": fields["org_email"],
-        "street_address": fields["street_address"],
-        "city": fields["city"],
-        "state": fields["state"],
-        "zip": fields["zip"],
-        "ein": item["ein"],
+        "org_phone": item["org_phone"],
+        "org_email": item["org_email"],
+        "street_address": item["street_address"],
+        "city": item["city"],
+        "state": item["state"],
+        "zip": item["zip"],
+        "ein": item.get("ein", ""),
         "is_active": item["is_active"],
-        "last_checked": fields["last_checked"],
+        "last_checked": item["last_checked"],
         "scraped_at": utc_now() if data_origin == "live_scrape" else None,
         "data_origin": data_origin,
         "contacts": {
@@ -551,11 +539,10 @@ def split_phone_values(value: str) -> list[str]:
 
 
 def source_address(item: dict[str, Any]) -> str | None:
-    fields = item["source_fields"]
-    street = usable_value(fields.get("street_address"))
-    city = usable_value(fields.get("city"))
-    state = usable_value(fields.get("state"))
-    zip_code = usable_value(fields.get("zip"))
+    street = usable_value(item.get("street_address"))
+    city = usable_value(item.get("city"))
+    state = usable_value(item.get("state"))
+    zip_code = usable_value(item.get("zip"))
     if not street:
         return None
     tail = " ".join(part for part in (state, zip_code) if part)
@@ -590,7 +577,7 @@ def build_inventory(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "raw",
                 )
 
-        primary = usable_value(item["source_fields"].get("org_phone"))
+        primary = usable_value(item.get("org_phone"))
         if primary:
             for phone in split_phone_values(primary):
                 unique_add(
@@ -604,7 +591,7 @@ def build_inventory(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "raw",
                 )
 
-        email = usable_value(item["source_fields"].get("org_email"))
+        email = usable_value(item.get("org_email"))
         if email and EMAIL_RE.fullmatch(email):
             unique_add(
                 result["contacts"]["emails"],
@@ -615,7 +602,7 @@ def build_inventory(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 },
                 "value",
             )
-        elif clean_text(item["source_fields"].get("org_email")).lower() == "contact form only":
+        elif clean_text(item.get("org_email")).lower() == "contact form only":
             result["extraction"]["notes"].append("A contact form is documented; no public email was supplied.")
 
         finalize(result)
