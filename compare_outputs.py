@@ -5,8 +5,8 @@ Use it to check that a faster mode (for example ``--fetch-mode auto``) finds
 the same data as a full browser run before switching to it.  It works on
 either the organization files or the metadata files:
 
-    python scrape_charity_contacts.py --output run_browser.json --metadata-output run_browser_meta.json
-    python scrape_charity_contacts.py --fetch-mode auto --output run_auto.json --metadata-output run_auto_meta.json
+    python scrape_charity_contacts.py --local-output --output run_browser.json --metadata-output run_browser_meta.json
+    python scrape_charity_contacts.py --local-output --fetch-mode auto --output run_auto.json --metadata-output run_auto_meta.json
     python compare_outputs.py run_browser.json run_auto.json
     python compare_outputs.py run_browser_meta.json run_auto_meta.json
 

@@ -34,14 +34,13 @@ python scrape_charity_contacts.py --input charity_scrape_targets.json --output c
 ```
 
 This writes two files, each a JSON array with one record per organization in
-the same order:
+the same order (see "Where the files are saved" for the location):
 
 - `charity_contacts_live.json` (`--output`): only the database fields, for
   the Power Automate import: `org_id`, `org_name`, `category`,
   `org_description`, `website_url`, `org_phone`, `org_email`,
   `street_address`, `city`, `state`, `zip`, `is_active`, and `last_checked`.
-- `Charity_Contacts_metadata.json` (`--metadata-output`, saved next to the
-  main file by default): everything else, matched by `org_id` and `org_name`.
+- `Charity_Contacts_metadata.json` (`--metadata-output`): everything else, matched by `org_id` and `org_name`.
   It has every graded value (`contacts.phones`, `contacts.addresses`,
   `contacts.emails`), the scrape status and review notes (`extraction`), the
   description/category values found on the website (`organization_details`),
@@ -62,9 +61,37 @@ the same order:
   value is kept.
 - `is_active` and `last_checked` come from the scrape itself (see below).
 
-For a small first test, add `--limit 3`. If a site behaves differently in
-headless Chrome, retry with `--show-browser`; do not try to bypass a site's
-access protections.
+For a small first test, add `--limit 3 --local-output` (see below for why
+`--local-output`). If a site behaves differently in headless Chrome, retry
+with `--show-browser`; do not try to bypass a site's access protections.
+
+### Where the files are saved
+
+By default each run is saved as a backup in OneDrive:
+
+- The folder is `Charity_Contacts` inside the OneDrive folder Windows reports
+  (`OneDriveCommercial`, `OneDrive`, or `OneDriveConsumer`), or
+  `~/OneDrive/Charity_Contacts`. Use `--onedrive-folder PATH` to choose
+  another folder. If no OneDrive folder is found, the run stops before
+  scraping and asks for `--onedrive-folder` or `--local-output`.
+- Each run creates `backup_<UTC date and time>` with both JSON files (named by
+  `--output` and `--metadata-output`) and a `.charity_backup.json` marker.
+- Only the newest **2** backups are kept: after a run saves successfully, the
+  oldest backup folder is deleted. Only folders the scraper created (with the
+  marker and nothing else inside) are ever deleted; other files in the folder
+  are left alone.
+- The files are first written to a local recovery folder
+  (`%LOCALAPPDATA%\Charity_Contacts_Recovery`). If OneDrive cannot be written,
+  they stay there, nothing old is deleted, and the run says where they are.
+- If Windows blocks deleting an old backup, the scraper asks for administrator
+  approval (a UAC prompt) for the cleanup only.
+
+Every run counts toward the 2 backups, including test runs with `--limit` and
+`--inventory-only` runs, so a small test run can push out a full backup. Use
+`--local-output` for those: it saves to the `--output` and
+`--metadata-output` paths you give (metadata defaults to
+`Charity_Contacts_metadata.json` next to `--output`) and does not touch the
+backups.
 
 ## Scrape status and is_active
 
@@ -184,8 +211,8 @@ sites only reveal email addresses with JavaScript, so compare once on the real
 sites before relying on it:
 
 ```bash
-python scrape_charity_contacts.py --output run_browser.json --metadata-output run_browser_meta.json
-python scrape_charity_contacts.py --fetch-mode auto --output run_auto.json --metadata-output run_auto_meta.json
+python scrape_charity_contacts.py --local-output --output run_browser.json --metadata-output run_browser_meta.json
+python scrape_charity_contacts.py --local-output --fetch-mode auto --output run_auto.json --metadata-output run_auto_meta.json
 python compare_outputs.py run_browser.json run_auto.json
 python compare_outputs.py run_browser_meta.json run_auto_meta.json
 ```
@@ -196,12 +223,13 @@ python compare_outputs.py run_browser_meta.json run_auto_meta.json
 ## Rebuild the included JSON files
 
 If you have the original Markdown table in the same folder, run the commands
-below. Give `--inventory-only` its own `--metadata-output`, so it does not
-replace the live scrape's `Charity_Contacts_metadata.json`.
+below. `--inventory-only` uses `--local-output` and its own
+`--metadata-output`, so it does not create a backup or replace a live scrape's
+metadata file.
 
 ```bash
 python scrape_charity_contacts.py --input "Pasted markdown(2).md" --export-targets --output charity_scrape_targets.json
-python scrape_charity_contacts.py --input "Pasted markdown(2).md" --inventory-only --output charity_contact_inventory.json --metadata-output charity_contact_inventory_metadata.json
+python scrape_charity_contacts.py --input "Pasted markdown(2).md" --inventory-only --local-output --output charity_contact_inventory.json --metadata-output charity_contact_inventory_metadata.json
 ```
 
 Use `--max-contact-pages 1` to reduce the crawl to the supplied page plus one

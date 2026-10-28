@@ -22,7 +22,14 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
 import re
 import threading
 import time
@@ -1704,6 +1711,213 @@ def split_records(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], 
     return organizations, metadata
 
 
+def onedrive_destination(explicit: str | None) -> Path:
+    """Use an explicit sync folder, or locate the user's local OneDrive root."""
+    if explicit:
+        return Path(explicit).expanduser()
+    for key in ("OneDriveCommercial", "OneDrive", "OneDriveConsumer"):
+        value = os.environ.get(key)
+        if value and Path(value).is_dir():
+            return Path(value) / "Charity_Contacts"
+    fallback = Path.home() / "OneDrive"
+    if fallback.is_dir():
+        return fallback / "Charity_Contacts"
+    raise ValueError(
+        "OneDrive folder not found. Pass --onedrive-folder with the full path "
+        "to your OneDrive destination, or --local-output to save locally."
+    )
+
+
+def remove_backup(folder: Path, names: list[str], marker_text: str) -> None:
+    """Remove only recorded files, retrying Windows read-only/sync errors.
+
+    Keep the marker after a partial failure so the next run can retry cleanup.
+    Never change permissions on the parent OneDrive folder or unrelated files.
+    """
+    marker = folder / ".charity_backup.json"
+
+    def remove_one(path: Path, directory: bool = False) -> None:
+        operation = path.rmdir if directory else path.unlink
+        try:
+            operation()
+        except FileNotFoundError:
+            return
+        except PermissionError:
+            # Windows maps S_IWRITE to clearing the read-only attribute.
+            # Preserve other mode bits (including directory traversal on POSIX).
+            path.chmod(path.stat().st_mode | stat.S_IWRITE)
+            operation()
+
+    for attempt in range(4):
+        try:
+            if not folder.exists():
+                return
+            # Recheck the directory before every retry; never remove added files.
+            if folder.is_symlink() or any(
+                entry.name not in {*names, marker.name} or entry.is_symlink()
+                for entry in folder.iterdir()
+            ):
+                raise OSError("Backup contents changed; leaving this folder for manual review.")
+            for name in names:
+                remove_one(folder / name)
+            remove_one(marker)
+            remove_one(folder, directory=True)
+            return
+        except OSError as exc:
+            # If the directory itself was locked after its files were removed,
+            # restore its ownership marker for cleanup on a later run.
+            if folder.is_dir() and not marker.exists():
+                try:
+                    marker.write_text(marker_text, encoding="utf-8")
+                except OSError:
+                    pass
+            temporary = isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in {5, 32, 33}
+            if not temporary or attempt == 3:
+                raise
+            time.sleep(0.5 * (2 ** attempt))
+
+
+def retry_backup_io(operation):
+    """Give OneDrive time to release a temporary access/sharing lock."""
+    for attempt in range(4):
+        try:
+            return operation()
+        except OSError as exc:
+            temporary = isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in {5, 32, 33}
+            if not temporary or attempt == 3:
+                raise
+            time.sleep(0.5 * (2 ** attempt))
+
+
+def save_backup_pair(folder: Path, records: list[dict[str, Any]],
+                     organization_name: str, metadata_name: str) -> tuple[Path, Path]:
+    """Save in the final folder and mark complete only after both files close.
+
+    Never rename a folder inside OneDrive. First retain a local recovery copy
+    so a sync/permission failure cannot discard the results of a long scrape.
+    Only a fully saved backup triggers retention cleanup.
+    """
+    recovery_base = (Path(os.environ["LOCALAPPDATA"]) if os.environ.get("LOCALAPPDATA")
+                     else Path.home()) / "Charity_Contacts_Recovery"
+    recovery_base.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix="unsynced_", dir=recovery_base))
+    organizations, metadata = split_records(records)
+    write_json(staging / organization_name, organizations)
+    write_json(staging / metadata_name, metadata)
+    backup = folder / ("backup_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ"))
+    marker = ".charity_backup.json"
+    marker_text = json.dumps({
+        "format": "charity_contacts_backup_v1",
+        "files": [organization_name, metadata_name],
+    })
+    try:
+        retry_backup_io(lambda: folder.mkdir(parents=True, exist_ok=True))
+        retry_backup_io(lambda: backup.mkdir(exist_ok=True))
+        for name in (organization_name, metadata_name):
+            retry_backup_io(lambda name=name: shutil.copyfile(staging / name, backup / name))
+        # The completion marker is written last. Unmarked partial folders are
+        # ignored by cleanup and never displace an older complete backup.
+        retry_backup_io(lambda: (backup / marker).write_text(marker_text, encoding="utf-8"))
+    except OSError as exc:
+        print(f"Could not finish saving to OneDrive: {exc}")
+        print(f"Both JSON files are safe in this local recovery folder: {staging}")
+        print("No old backups were deleted. Close open files or let OneDrive finish "
+              "syncing, then copy the recovery files into OneDrive.")
+        return staging / organization_name, staging / metadata_name
+    shutil.rmtree(staging, ignore_errors=True)
+    try:
+        cleanup_old_backups(folder)
+    except OSError as exc:
+        # Retention trouble must not turn a completed save into a failed scrape.
+        print(f"Both JSON files were saved to {backup}, but backup cleanup failed: {exc}")
+    return backup / organization_name, backup / metadata_name
+
+
+def request_admin_cleanup(folder: Path) -> bool:
+    """Request Windows UAC elevation for cleanup only, never for Chrome."""
+    if sys.platform != "win32":
+        return False
+
+    def ps_literal(value: str) -> str:
+        return "'" + value.replace("'", "''") + "'"
+
+    script_path = Path(__file__).resolve()
+    arguments = subprocess.list2cmdline([
+        str(script_path), "--cleanup-backups-only", str(folder.resolve()),
+    ])
+    # Encode a PowerShell program with literal paths; shell=False prevents
+    # cmd.exe expansion. Start-Process receives a single quoted argument list.
+    command = (
+        "$ErrorActionPreference = 'Stop'; try { "
+        "$cleanupProcess = Start-Process -FilePath " + ps_literal(sys.executable)
+        + " -ArgumentList " + ps_literal(arguments)
+        + " -WorkingDirectory " + ps_literal(str(script_path.parent))
+        + " -Verb RunAs -Wait -PassThru; exit $cleanupProcess.ExitCode "
+        "} catch { Write-Error $_ -ErrorAction Continue; exit 1 }"
+    )
+    encoded = base64.b64encode(command.encode("utf-16-le")).decode("ascii")
+    print("Windows blocked backup cleanup. Approve the UAC prompt to delete older "
+          "backups as administrator; Chrome will keep running normally.", flush=True)
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+            check=False,
+        )
+    except OSError as exc:
+        print(f"Could not start administrator cleanup: {exc}")
+        return False
+    if result.returncode == 0:
+        print("Administrator backup cleanup finished.")
+        return True
+    print("Administrator cleanup was cancelled or failed. New JSON files remain saved; "
+          "older backups may remain. Close open files and let OneDrive finish syncing.")
+    return False
+
+
+def cleanup_old_backups(folder: Path, allow_elevation: bool = True) -> bool:
+    """Recheck ownership and keep the newest two, optionally elevating on denial."""
+    marker = ".charity_backup.json"
+    managed = []
+    for candidate in folder.iterdir():
+        if (candidate.is_symlink() or not candidate.is_dir()
+                or not re.fullmatch(r"backup_\d{8}T\d{6}_\d{6}Z", candidate.name)):
+            continue
+        try:
+            info = json.loads((candidate / marker).read_text(encoding="utf-8"))
+            names = info.get("files", [])
+            if (info.get("format") != "charity_contacts_backup_v1"
+                    or len(names) != 2 or len(set(names)) != 2
+                    or any(not isinstance(name, str) or Path(name).name != name
+                           or not name.endswith(".json") for name in names)
+                    or not {entry.name for entry in candidate.iterdir()} <= {*names, marker}
+                    or any(not entry.is_file() or entry.is_symlink()
+                           for entry in candidate.iterdir())):
+                continue
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+        managed.append(candidate)
+    failed = False
+    needs_admin = False
+    for old in sorted(managed, key=lambda path: path.name)[:-2]:
+        try:
+            marker_text = (old / marker).read_text(encoding="utf-8")
+            remove_backup(old, json.loads(marker_text)["files"], marker_text)
+            print(f"Deleted oldest backup: {old}")
+        except OSError as exc:
+            failed = True
+            needs_admin |= isinstance(exc, PermissionError) or getattr(exc, "winerror", None) == 5
+            print(f"Could not remove old backup {old}: {exc}")
+    if needs_admin and allow_elevation and sys.platform == "win32":
+        # One prompt for the whole run. The elevated child re-scans backups
+        # and cannot start scraping or recursively request elevation.
+        return request_admin_cleanup(folder)
+    if failed:
+        print("New JSON files remain saved. Close files open in the backup folder, "
+              "let OneDrive finish syncing, then rerun. More than two backups may "
+              "remain until Windows allows deletion.")
+    return not failed
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Extract public charity profiles and contact details into reviewable JSON."
@@ -1716,13 +1930,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         default="charity_contacts_live.json",
-        help="Organization JSON output path (target list path with --export-targets).",
+        help="Organization filename in each OneDrive backup; full path with --local-output or --export-targets.",
     )
     parser.add_argument(
         "--metadata-output",
         default=None,
-        help="Contact/review JSON path (default: Charity_Contacts_metadata.json beside --output). "
+        help="Metadata filename in each OneDrive backup; full path with --local-output. "
+             "Default: Charity_Contacts_metadata.json. "
              "Not used with --export-targets.",
+    )
+    destination = parser.add_mutually_exclusive_group()
+    destination.add_argument(
+        "--onedrive-folder", default=None,
+        help="Full local OneDrive destination path. Default: Charity_Contacts in detected OneDrive.",
+    )
+    destination.add_argument(
+        "--local-output", action="store_true",
+        help="Save to --output/--metadata-output paths locally without backup rotation.",
     )
     parser.add_argument(
         "--inventory-only",
@@ -1789,7 +2013,10 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Process only the first N organizations (useful for a small test run).",
     )
+    parser.add_argument("--cleanup-backups-only", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.cleanup_backups_only is not None:
+        return args
     if args.delay_seconds < 0:
         parser.error("--delay-seconds must be nonnegative.")
     if args.workers < 1 or args.http_workers < 1:
@@ -1801,17 +2028,36 @@ def parse_args() -> argparse.Namespace:
     if args.inventory_only and args.export_targets:
         parser.error("Choose either --inventory-only or --export-targets, not both.")
     if not args.export_targets:
-        metadata_path = Path(args.metadata_output) if args.metadata_output else Path(args.output).with_name("Charity_Contacts_metadata.json")
-        protected_paths = {Path(args.input).resolve(), Path(args.output).resolve()}
-        if metadata_path.resolve() in protected_paths:
-            parser.error("The metadata output must differ from the input and organization output paths.")
-        if Path(args.input).resolve() == Path(args.output).resolve():
-            parser.error("The organization output must differ from the input path.")
+        if args.local_output:
+            metadata_path = Path(args.metadata_output) if args.metadata_output else Path(args.output).with_name("Charity_Contacts_metadata.json")
+            protected_paths = {Path(args.input).resolve(), Path(args.output).resolve()}
+            if metadata_path.resolve() in protected_paths:
+                parser.error("The metadata output must differ from the input and organization output paths.")
+            if Path(args.input).resolve() == Path(args.output).resolve():
+                parser.error("The organization output must differ from the input path.")
+        else:
+            if Path(args.output).name.casefold() == Path(args.metadata_output or "Charity_Contacts_metadata.json").name.casefold():
+                parser.error("Organization and metadata filenames must differ.")
+            for name in (Path(args.output).name, Path(args.metadata_output or "Charity_Contacts_metadata.json").name):
+                if not name.lower().endswith(".json") or name.startswith("."):
+                    parser.error("Output filenames must be non-hidden .json files.")
+            try:
+                args.backup_folder = onedrive_destination(args.onedrive_folder)
+            except ValueError as exc:
+                parser.error(str(exc))
     return args
 
 
 def main() -> None:
     args = parse_args()
+    if args.cleanup_backups_only is not None:
+        # Separate cleanup process: no target loading, scraping, or new backups.
+        try:
+            success = cleanup_old_backups(Path(args.cleanup_backups_only), allow_elevation=False)
+        except OSError as exc:
+            print(f"Backup cleanup failed: {exc}")
+            success = False
+        raise SystemExit(0 if success else 1)
     input_path = Path(args.input)
     output_path = Path(args.output)
     
@@ -1846,6 +2092,12 @@ def main() -> None:
 
     if args.export_targets:
         write_json(output_path, records)
+    elif not args.local_output:
+        output_path, metadata_path = save_backup_pair(
+            args.backup_folder, records, output_path.name,
+            Path(args.metadata_output or "Charity_Contacts_metadata.json").name,
+        )
+        print(f"Wrote {len(records)} contact/metadata records to {metadata_path}")
     else:
         metadata_path = (Path(args.metadata_output) if args.metadata_output
                          else output_path.with_name("Charity_Contacts_metadata.json"))
