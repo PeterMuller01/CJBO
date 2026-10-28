@@ -90,15 +90,22 @@ By default each run is saved as a backup in OneDrive:
 ### Change report
 
 Each backup has a `change_report.txt` comparing this run's main file with the
-previous backup's. It lists every charity in run order, matched by `org_id`:
+previous backup's, matching charities by `org_id`. It lists only the charities
+that changed (in run order, with a blank line between them), then how many had
+no change:
 
 ```text
-Summary: 5 charities | 4 changed | 1 no change | 0 new | 0 removed
+Summary: 58 charities | 2 changed | 56 no change | 0 new | 0 removed
 
-Beyond Abuse (CF-002): No Change
+Carolina Family Services (CF-003)
+    org_phone: "Not found" -> "(864) 283-0637"
+    street_address: "301 Anderson St." -> "17 Memorial Medical Drive"
+
 Children's Place (CF-007)
     org_phone: "Not listed" -> "(803) 641-4144"
     street_address: "137 Prosperity Ln." -> "155 Prosperity Lane NE"
+
+(56 charities had no change)
 ```
 
 - A changed charity lists each changed field with its old and new value (long

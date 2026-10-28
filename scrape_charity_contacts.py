@@ -1810,7 +1810,7 @@ def report_value(value: Any) -> str:
 
 def build_change_report(organizations: list[dict[str, Any]], previous: tuple[Path, list[str]] | None,
                         run_name: str) -> str:
-    """Plain-text list of every charity: the fields that changed, or No Change."""
+    """Plain-text report: each changed or new charity, then a count of the unchanged ones."""
     lines = ["Charity Contacts Change Report", "=" * 30,
              f"This run:      {run_name} ({backup_time(run_name)})"]
     if previous is None:
@@ -1836,7 +1836,7 @@ def build_change_report(organizations: list[dict[str, Any]], previous: tuple[Pat
         old = old_by_key.pop(key(record), None)
         if old is None:
             added += 1
-            body.append(f"{label}: New charity (not in the previous run)")
+            body.append([f"{label}: New charity (not in the previous run)"])
             continue
         # Fields an older backup did not have yet are skipped, not reported.
         differences = [f"    {field}: {report_value(old[field])} -> {report_value(record.get(field))}"
@@ -1844,14 +1844,19 @@ def build_change_report(organizations: list[dict[str, Any]], previous: tuple[Pat
                        if field in old and clean_text(old[field]) != clean_text(record.get(field))]
         if differences:
             changed += 1
-            body += [label, *differences]
+            body.append([label, *differences])
         else:
             unchanged += 1
-            body.append(f"{label}: No Change")
     lines += [f"Fields compared: {', '.join(REPORT_FIELDS)}",
               "(last_checked is not compared because it is updated on every run.)", "",
               f"Summary: {len(organizations)} charities | {changed} changed | {unchanged} no change | "
-              f"{added} new | {len(old_by_key)} removed", "", *body]
+              f"{added} new | {len(old_by_key)} removed", ""]
+    # A blank line between charities keeps each one's changes easy to read.
+    for block in body:
+        lines += [*block, ""]
+    if not body:
+        lines += ["No charities changed.", ""]
+    lines.append(f"({unchanged} {'charity' if unchanged == 1 else 'charities'} had no change)")
     if old_by_key:
         lines += ["", "Removed since the previous run (no longer in the target list):"]
         lines += [f"    {old.get('org_name') or '(no name)'} ({old.get('org_id') or 'no ID'})"
