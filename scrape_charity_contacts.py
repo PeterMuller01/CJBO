@@ -1789,6 +1789,76 @@ def retry_backup_io(operation):
             time.sleep(0.5 * (2 ** attempt))
 
 
+CHANGE_REPORT_NAME = "change_report.txt"
+# last_checked is the scrape date, so it changes every run and is not reported.
+REPORT_FIELDS = tuple(f for f in ORGANIZATION_OUTPUT_FIELDS if f not in ("org_id", "last_checked"))
+
+
+def backup_time(name: str) -> str:
+    try:
+        return datetime.strptime(name, "backup_%Y%m%dT%H%M%S_%fZ").strftime("%Y-%m-%d %H:%M:%S UTC")
+    except ValueError:
+        return name
+
+
+def report_value(value: Any) -> str:
+    value = clean_text(value)
+    if not value:
+        return "(blank)"
+    return f'"{value[:150]}..."' if len(value) > 150 else f'"{value}"'
+
+
+def build_change_report(organizations: list[dict[str, Any]], previous: tuple[Path, list[str]] | None,
+                        run_name: str) -> str:
+    """Plain-text list of every charity: the fields that changed, or No Change."""
+    lines = ["Charity Contacts Change Report", "=" * 30,
+             f"This run:      {run_name} ({backup_time(run_name)})"]
+    if previous is None:
+        lines += ["Compared with: nothing (no earlier backup was found)", "",
+                  "This is the first saved run, so there is nothing to compare yet.",
+                  f"{len(organizations)} charities were saved."]
+        return "\n".join(lines) + "\n"
+    folder, names = previous
+    lines.append(f"Compared with: {folder.name} ({backup_time(folder.name)})")
+    try:
+        old_records = json.loads((folder / names[0]).read_text(encoding="utf-8"))
+        if not isinstance(old_records, list):
+            raise ValueError("not a list of charities")
+    except (OSError, ValueError) as exc:
+        lines += ["", f"The earlier backup could not be read ({exc}), so nothing was compared."]
+        return "\n".join(lines) + "\n"
+
+    key = lambda record: clean_text(record.get("org_id")) or clean_text(record.get("org_name"))
+    old_by_key = {key(record): record for record in old_records if isinstance(record, dict)}
+    body, changed, unchanged, added = [], 0, 0, 0
+    for record in organizations:
+        label = f"{record.get('org_name') or '(no name)'} ({record.get('org_id') or 'no ID'})"
+        old = old_by_key.pop(key(record), None)
+        if old is None:
+            added += 1
+            body.append(f"{label}: New charity (not in the previous run)")
+            continue
+        # Fields an older backup did not have yet are skipped, not reported.
+        differences = [f"    {field}: {report_value(old[field])} -> {report_value(record.get(field))}"
+                       for field in REPORT_FIELDS
+                       if field in old and clean_text(old[field]) != clean_text(record.get(field))]
+        if differences:
+            changed += 1
+            body += [label, *differences]
+        else:
+            unchanged += 1
+            body.append(f"{label}: No Change")
+    lines += [f"Fields compared: {', '.join(REPORT_FIELDS)}",
+              "(last_checked is not compared because it is updated on every run.)", "",
+              f"Summary: {len(organizations)} charities | {changed} changed | {unchanged} no change | "
+              f"{added} new | {len(old_by_key)} removed", "", *body]
+    if old_by_key:
+        lines += ["", "Removed since the previous run (no longer in the target list):"]
+        lines += [f"    {old.get('org_name') or '(no name)'} ({old.get('org_id') or 'no ID'})"
+                  for old in old_by_key.values()]
+    return "\n".join(lines) + "\n"
+
+
 def save_backup_pair(folder: Path, records: list[dict[str, Any]],
                      organization_name: str, metadata_name: str) -> tuple[Path, Path]:
     """Save in the final folder and mark complete only after both files close.
@@ -1805,26 +1875,35 @@ def save_backup_pair(folder: Path, records: list[dict[str, Any]],
     write_json(staging / organization_name, organizations)
     write_json(staging / metadata_name, metadata)
     backup = folder / ("backup_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ"))
+    # Compare with the newest complete backup before this one is added.
+    try:
+        previous = (managed_backups(folder) or [None])[-1]
+    except OSError:
+        previous = None
+    (staging / CHANGE_REPORT_NAME).write_text(
+        build_change_report(organizations, previous, backup.name), encoding="utf-8")
+    files = [organization_name, metadata_name, CHANGE_REPORT_NAME]
     marker = ".charity_backup.json"
     marker_text = json.dumps({
         "format": "charity_contacts_backup_v1",
-        "files": [organization_name, metadata_name],
+        "files": files,
     })
     try:
         retry_backup_io(lambda: folder.mkdir(parents=True, exist_ok=True))
         retry_backup_io(lambda: backup.mkdir(exist_ok=True))
-        for name in (organization_name, metadata_name):
+        for name in files:
             retry_backup_io(lambda name=name: shutil.copyfile(staging / name, backup / name))
         # The completion marker is written last. Unmarked partial folders are
         # ignored by cleanup and never displace an older complete backup.
         retry_backup_io(lambda: (backup / marker).write_text(marker_text, encoding="utf-8"))
     except OSError as exc:
         print(f"Could not finish saving to OneDrive: {exc}")
-        print(f"Both JSON files are safe in this local recovery folder: {staging}")
+        print(f"Both JSON files and the change report are safe in this local recovery folder: {staging}")
         print("No old backups were deleted. Close open files or let OneDrive finish "
               "syncing, then copy the recovery files into OneDrive.")
         return staging / organization_name, staging / metadata_name
     shutil.rmtree(staging, ignore_errors=True)
+    print(f"Wrote change report to {backup / CHANGE_REPORT_NAME}")
     try:
         cleanup_old_backups(folder)
     except OSError as exc:
@@ -1874,10 +1953,17 @@ def request_admin_cleanup(folder: Path) -> bool:
     return False
 
 
-def cleanup_old_backups(folder: Path, allow_elevation: bool = True) -> bool:
-    """Recheck ownership and keep the newest two, optionally elevating on denial."""
+def managed_backups(folder: Path) -> list[tuple[Path, list[str]]]:
+    """Complete backups this scraper created, oldest first, with their files.
+
+    A backup holds the two JSON files and, from newer runs, the change report.
+    Anything else inside (or a missing/odd marker) means it is not ours to use
+    or delete.
+    """
     marker = ".charity_backup.json"
     managed = []
+    if not folder.is_dir():
+        return managed
     for candidate in folder.iterdir():
         if (candidate.is_symlink() or not candidate.is_dir()
                 or not re.fullmatch(r"backup_\d{8}T\d{6}_\d{6}Z", candidate.name)):
@@ -1886,16 +1972,24 @@ def cleanup_old_backups(folder: Path, allow_elevation: bool = True) -> bool:
             info = json.loads((candidate / marker).read_text(encoding="utf-8"))
             names = info.get("files", [])
             if (info.get("format") != "charity_contacts_backup_v1"
-                    or len(names) != 2 or len(set(names)) != 2
-                    or any(not isinstance(name, str) or Path(name).name != name
-                           or not name.endswith(".json") for name in names)
+                    or len(names) not in (2, 3) or len(set(names)) != len(names)
+                    or any(not isinstance(name, str) or Path(name).name != name for name in names)
+                    or not all(name.endswith(".json") for name in names[:2])
+                    or names[2:] not in ([], [CHANGE_REPORT_NAME])
                     or not {entry.name for entry in candidate.iterdir()} <= {*names, marker}
                     or any(not entry.is_file() or entry.is_symlink()
                            for entry in candidate.iterdir())):
                 continue
         except (OSError, ValueError, TypeError, AttributeError):
             continue
-        managed.append(candidate)
+        managed.append((candidate, names))
+    return sorted(managed, key=lambda pair: pair[0].name)
+
+
+def cleanup_old_backups(folder: Path, allow_elevation: bool = True) -> bool:
+    """Recheck ownership and keep the newest two, optionally elevating on denial."""
+    marker = ".charity_backup.json"
+    managed = [path for path, _ in managed_backups(folder)]
     failed = False
     needs_admin = False
     for old in sorted(managed, key=lambda path: path.name)[:-2]:

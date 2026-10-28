@@ -75,7 +75,8 @@ By default each run is saved as a backup in OneDrive:
   another folder. If no OneDrive folder is found, the run stops before
   scraping and asks for `--onedrive-folder` or `--local-output`.
 - Each run creates `backup_<UTC date and time>` with both JSON files (named by
-  `--output` and `--metadata-output`) and a `.charity_backup.json` marker.
+  `--output` and `--metadata-output`), a `change_report.txt` (see "Change
+  report" below), and a `.charity_backup.json` marker.
 - Only the newest **2** backups are kept: after a run saves successfully, the
   oldest backup folder is deleted. Only folders the scraper created (with the
   marker and nothing else inside) are ever deleted; other files in the folder
@@ -85,6 +86,28 @@ By default each run is saved as a backup in OneDrive:
   they stay there, nothing old is deleted, and the run says where they are.
 - If Windows blocks deleting an old backup, the scraper asks for administrator
   approval (a UAC prompt) for the cleanup only.
+
+### Change report
+
+Each backup has a `change_report.txt` comparing this run's main file with the
+previous backup's. It lists every charity in run order, matched by `org_id`:
+
+```text
+Summary: 5 charities | 4 changed | 1 no change | 0 new | 0 removed
+
+Beyond Abuse (CF-002): No Change
+Children's Place (CF-007)
+    org_phone: "Not listed" -> "(803) 641-4144"
+    street_address: "137 Prosperity Ln." -> "155 Prosperity Lane NE"
+```
+
+- A changed charity lists each changed field with its old and new value (long
+  values are shortened to 150 characters).
+- Charities added to the target list since the previous run are marked "New
+  charity"; ones no longer in the list are listed under "Removed" at the end.
+- `last_checked` is not compared, because it changes on every run.
+- The first run has nothing to compare with, and its report says so.
+- `--local-output` runs do not make backups, so they do not make a report.
 
 Every run counts toward the 2 backups, including test runs with `--limit` and
 `--inventory-only` runs, so a small test run can push out a full backup. Use
