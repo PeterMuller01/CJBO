@@ -14,6 +14,8 @@ their shelter locations are confidential.
 
 ## Files
 
+- `charity_gui.py`: a desktop window for editing the charity list and running
+  the scraper (see "Desktop app").
 - `scrape_charity_contacts.py`: the Botasaurus scraper and JSON converter.
 - `compare_outputs.py`: compares two output files record by record.
 - `charity_scrape_targets.json`: the 58-site input list. Each entry has only
@@ -23,6 +25,39 @@ their shelter locations are confidential.
   fields (at least `org_id`, `org_name`, and `website_url`).
 - `charity_contact_inventory.json`: the existing contact values from the
   supplied table, converted to JSON. This is not a fresh web scrape.
+
+## Desktop app
+
+For a point-and-click way to manage the list and run the scraper:
+
+```bash
+python -m pip install -r requirements.txt
+python charity_gui.py
+```
+
+Tkinter comes with the standard Windows and Mac Python installers; on Linux,
+install your distribution's `python3-tk` package. The window has two tabs:
+
+- **Charities** edits `charity_scrape_targets.json` (or any list opened with
+  "Open list..."). Pick a charity to edit it, or press "New charity". Only the
+  website URL is required (`https://` is added if left off); the name,
+  category, and description are recommended, and every other field can be
+  filled in when the client has it. A blank ID gets the next `CF-###` number.
+  The form checks for a repeated website or ID and for badly formatted email,
+  phone, state, ZIP, and date values. "Add to list"/"Update charity" changes
+  the list in the window; "Save list" writes the file.
+- **Run** chooses the options and runs the scraper. It covers the charity list
+  file, a test run of the first few charities (which switches to local files
+  so it does not use up a OneDrive backup), OneDrive backups or local files,
+  the number of browsers (with a memory estimate for this computer), the
+  faster fetch mode, and the advanced options under "Show advanced options".
+  The command it will run is shown, the log and progress update live, Stop
+  ends the run and its browsers, and when it finishes the change report and
+  output folder open with one click. If the list has unsaved changes, it
+  offers to save them first.
+
+The app runs the same `scrape_charity_contacts.py` command described below,
+so the two always behave the same.
 
 ## Run a fresh scrape
 
