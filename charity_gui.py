@@ -20,6 +20,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import tkinter as tk
 import tkinter.font as tkfont
@@ -52,17 +53,13 @@ FORM_FIELDS = (
     ("city", "City", "Optional"),
     ("state", "State", "Optional"),
     ("zip", "ZIP code", "Optional"),
-    ("is_active", "Active status", "Optional"),
-    ("last_checked", "Last checked", "Optional"),
 )
 FIELD_HINTS = {
     "website_url": "e.g. https://beyondabuse.info/",
     "org_id": "Leave blank to assign the next CF-### number",
     "org_phone": "e.g. (864) 227-1623",
     "state": "Two letters, e.g. SC",
-    "last_checked": "YYYY-MM-DD",
 }
-ACTIVE_CHOICES = ("", "Yes", "No", "Unsuccessful check, manual review")
 
 
 # --- Charity list helpers (no window needed, so they are easy to test) ------
@@ -107,11 +104,6 @@ def validate_charity(values: dict[str, str], others: list[dict[str, str]]) -> tu
         errors.append("State should be a two-letter abbreviation, e.g. SC.")
     if usable_value(values["zip"]) and not re.fullmatch(r"\d{5}(-\d{4})?", values["zip"]):
         errors.append("ZIP code should be 5 digits (or ZIP+4).")
-    if values["last_checked"]:
-        try:
-            datetime.strptime(values["last_checked"], "%Y-%m-%d")
-        except ValueError:
-            errors.append("Last checked should be a date like 2026-10-08.")
     missing = [label for key, label, group in FORM_FIELDS if group == "Recommended" and not values[key]]
     if missing:
         warnings.append("Recommended but blank: " + ", ".join(missing) + ".")
@@ -181,6 +173,98 @@ class ScrollFrame(ttk.Frame):
             self.canvas.yview_scroll(-1, "units")
         else:
             self.canvas.yview_scroll(1, "units")
+
+
+# --- Database spreadsheet helpers ----------------------------------------------
+#
+# Power Automate turns charity_contacts_live.json into an Excel spreadsheet in
+# this folder.  The Database tab only reads it and writes the cells a person
+# edits; scraped data reaches it only through Power Automate.
+
+DATABASE_FIELDS = (
+    "org_id", "org_name", "category", "org_description", "website_url", "org_phone",
+    "org_email", "street_address", "city", "state", "zip", "is_active", "last_checked",
+)
+DATABASE_LABELS = {key: label for key, label, _ in FORM_FIELDS} | {
+    "is_active": "Active status", "last_checked": "Last checked"}
+# org_id identifies the row; the other two are set by every scrape.
+READ_ONLY_DATABASE_FIELDS = ("org_id", "is_active", "last_checked")
+
+
+def cell_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+def find_charity_table(workbook: Any) -> tuple[Any, int, int, dict[str, int]]:
+    """(sheet, header row, last row, {column name: column number}) of the charity table."""
+    from openpyxl.utils import range_boundaries
+
+    for sheet in workbook.worksheets:
+        refs = [sheet.tables[name].ref for name in sheet.tables] or [sheet.dimensions]
+        for ref in refs:
+            first_col, header_row, last_col, last_row = range_boundaries(ref)
+            columns = {cell_text(sheet.cell(header_row, col).value): col for col in range(first_col, last_col + 1)}
+            if "org_id" in columns and "website_url" in columns:
+                return sheet, header_row, last_row, columns
+    raise ValueError("No sheet has org_id and website_url columns.")
+
+
+def read_database(path: Path) -> list[dict[str, str]]:
+    from openpyxl import load_workbook
+
+    sheet, header_row, last_row, columns = find_charity_table(load_workbook(path, data_only=True))
+    rows = []
+    for row in range(header_row + 1, last_row + 1):
+        record = {field: cell_text(sheet.cell(row, columns[field]).value) if field in columns else ""
+                  for field in DATABASE_FIELDS}
+        if any(record.values()):
+            rows.append(record)
+    return rows
+
+
+def find_spreadsheet(folder: Path) -> Path | None:
+    """The newest .xlsx in the folder that has the charity columns."""
+    candidates = sorted((path for path in folder.glob("*.xlsx") if not path.name.startswith(("~$", "."))),
+                        key=lambda path: path.stat().st_mtime, reverse=True)
+    for path in candidates:
+        try:
+            read_database(path)
+            return path
+        except Exception:  # not the charity spreadsheet, or unreadable
+            continue
+    return None
+
+
+def write_database_changes(path: Path, org_id: str, changes: dict[str, str]) -> None:
+    """Write only the edited cells of one charity, re-reading the file first.
+
+    Re-reading keeps anything Power Automate wrote since the tab was loaded.
+    The new file replaces the old one only once it is completely written.
+    """
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(path)
+    sheet, header_row, last_row, columns = find_charity_table(workbook)
+    row = next((row for row in range(header_row + 1, last_row + 1)
+                if cell_text(sheet.cell(row, columns["org_id"]).value) == org_id), None)
+    if row is None:
+        raise ValueError(f"{org_id} is no longer in the spreadsheet. Reload it and try again.")
+    for field, value in changes.items():
+        if field in columns:
+            sheet.cell(row, columns[field]).value = value
+    descriptor, temporary = tempfile.mkstemp(prefix=".charity_db_", suffix=".xlsx", dir=path.parent)
+    os.close(descriptor)
+    try:
+        workbook.save(temporary)
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 # --- Charities tab ------------------------------------------------------------
@@ -291,9 +375,6 @@ class CharitiesTab(ttk.Frame):
             elif key == "category":
                 self.category_box = ttk.Combobox(frame, textvariable=var)
                 self.category_box.grid(row=row, column=1, sticky="ew", pady=2)
-            elif key == "is_active":
-                ttk.Combobox(frame, textvariable=var, values=ACTIVE_CHOICES, state="readonly").grid(
-                    row=row, column=1, sticky="ew", pady=2)
             else:
                 ttk.Entry(frame, textvariable=var).grid(row=row, column=1, sticky="ew", pady=2)
             row += 1
@@ -472,9 +553,253 @@ class CharitiesTab(ttk.Frame):
         self.app.run_tab.target_var.set(name)
         return self.save()
 
+    def apply_database_changes(self, org_id: str, changes: dict[str, str]) -> str:
+        """Copy Database-tab edits into the charity list and save it.
+
+        Returns a short note for the user.  The scraper prefers the list's
+        values (e.g. description), so this keeps the client's edit on the
+        next scrape.
+        """
+        index = next((i for i, record in enumerate(self.records) if record["org_id"] == org_id), None)
+        if self.path is None or index is None:
+            return "This charity is not in the open charity list, so only the spreadsheet was changed."
+        self.records[index] = {**self.records[index], **changes}
+        if self.selected == index:
+            self.fill_form(self.records[index])
+        self.update_categories()
+        self.refresh_list(select=self.selected)
+        try:
+            write_json(self.path, self.records)
+        except OSError as exc:
+            self.set_dirty(True)
+            return f"The charity list could not be saved ({exc}); save it from the Charities tab."
+        self.set_dirty(False)
+        return f"Also saved to {self.path.name}, so the next scrape keeps it."
+
     def confirm_discard_list(self) -> bool:
         return not self.dirty or messagebox.askyesno(
             "Unsaved list", "The charity list has unsaved changes. Discard them?", parent=self)
+
+
+# --- Database tab -------------------------------------------------------------
+
+class DatabaseTab(ttk.Frame):
+    def __init__(self, master: tk.Misc, app: "CharityApp") -> None:
+        super().__init__(master, padding=10)
+        self.app = app
+        self.path: Path | None = None
+        self.rows: list[dict[str, str]] = []
+        self.selected: int | None = None
+
+        bar = ttk.Frame(self)
+        bar.pack(fill="x")
+        ttk.Button(bar, text="Choose spreadsheet...", command=self.choose_file).pack(side="left")
+        ttk.Button(bar, text="Reload", command=self.reload).pack(side="left", padx=4)
+        self.file_label = ttk.Label(bar, text="")
+        self.file_label.pack(side="left", padx=12)
+        ttk.Label(self, foreground="#555", wraplength=1100, justify="left", text=(
+            "This is the database spreadsheet Power Automate builds from the scraper's live file. "
+            "Edits saved here change the spreadsheet; edits to fields the charity list has (name, "
+            "category, description, website, phone, email, address) are saved to the list too, so the "
+            "next scrape keeps them. Scraped data only reaches the spreadsheet through Power Automate."
+        )).pack(fill="x", pady=(6, 0))
+
+        body = ttk.PanedWindow(self, orient="horizontal")
+        body.pack(fill="both", expand=True, pady=(8, 0))
+        body.add(self.build_list(body), weight=1)
+        right = ttk.Frame(body)
+        form = ScrollFrame(right, fit_width=False)
+        actions = ttk.Frame(right, padding=(10, 6, 10, 0))
+        actions.pack(side="bottom", fill="x")
+        form.pack(side="top", fill="both", expand=True)
+        self.build_form(form.inner, actions)
+        body.add(right, weight=1)
+
+    def build_list(self, master: tk.Misc) -> ttk.Frame:
+        frame = ttk.Frame(master, padding=(0, 0, 10, 0))
+        search = ttk.Frame(frame)
+        search.pack(fill="x")
+        ttk.Label(search, text="Search:").pack(side="left")
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *_: self.refresh_list())
+        ttk.Entry(search, textvariable=self.search_var).pack(side="left", fill="x", expand=True, padx=(6, 0))
+        columns = ("org_id", "org_name", "org_phone", "is_active", "last_checked")
+        tree_frame = ttk.Frame(frame)
+        tree_frame.pack(fill="both", expand=True, pady=(6, 0))
+        self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="browse")
+        for column, title, width in zip(columns, ("ID", "Name", "Phone", "Active", "Checked"),
+                                        (64, 190, 120, 60, 90)):
+            self.tree.heading(column, text=title)
+            self.tree.column(column, width=width, stretch=column == "org_name")
+        scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.tree.bind("<<TreeviewSelect>>", self.on_select)
+        self.count_label = ttk.Label(frame, text="")
+        self.count_label.pack(anchor="w", pady=(6, 0))
+        return frame
+
+    def build_form(self, master: tk.Misc, actions: ttk.Frame) -> None:
+        frame = ttk.Frame(master, padding=(10, 0, 10, 0))
+        frame.pack(fill="both", expand=True)
+        self.title_label = ttk.Label(frame, text="Choose a charity on the left")
+        self.title_label.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        self.vars: dict[str, tk.StringVar] = {}
+        for row, field in enumerate(DATABASE_FIELDS, start=1):
+            label = DATABASE_LABELS[field] + (" (set by each scrape)" if field in ("is_active", "last_checked") else "")
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="nw", padx=(0, 8), pady=2)
+            if field == "org_description":
+                self.description = tk.Text(frame, height=6, wrap="word", font="TkDefaultFont")
+                self.description.grid(row=row, column=1, sticky="ew", pady=2)
+                continue
+            var = self.vars[field] = tk.StringVar()
+            state = "readonly" if field in READ_ONLY_DATABASE_FIELDS else "normal"
+            ttk.Entry(frame, textvariable=var, state=state).grid(row=row, column=1, sticky="ew", pady=2)
+        frame.columnconfigure(1, weight=1)
+        self.message = ttk.Label(actions, text="", foreground="#a15c00", wraplength=480, justify="left")
+        self.message.pack(anchor="w")
+        buttons = ttk.Frame(actions)
+        buttons.pack(anchor="w", pady=(4, 0))
+        self.save_button = ttk.Button(buttons, text="Save changes to database", command=self.save, state="disabled")
+        self.save_button.pack(side="left")
+        self.undo_button = ttk.Button(buttons, text="Undo changes", command=self.undo, state="disabled")
+        self.undo_button.pack(side="left", padx=4)
+
+    # Loading ---------------------------------------------------------------------
+    def load(self, path: Path | None) -> None:
+        self.path = path
+        self.rows, self.selected = [], None
+        if path is None:
+            self.file_label.configure(text="No database spreadsheet found in this folder. Use Choose spreadsheet.")
+        else:
+            try:
+                self.rows = read_database(path)
+                self.file_label.configure(text=f"{path.name} (loaded {datetime.now():%H:%M})")
+            except ImportError:
+                self.file_label.configure(text="Reading spreadsheets needs openpyxl: pip install -r requirements.txt")
+            except Exception as exc:
+                self.file_label.configure(text=f"Could not read {path.name}: {exc}")
+        self.clear_form()
+        self.refresh_list()
+
+    def reload(self) -> None:
+        if self.form_changes() and not messagebox.askyesno(
+                "Unsaved edits", "Discard your unsaved edits and reload?", parent=self):
+            return
+        self.load(self.path or find_spreadsheet(HERE))
+
+    def choose_file(self) -> None:
+        name = filedialog.askopenfilename(parent=self, title="Choose the database spreadsheet",
+                                          initialdir=str(self.path.parent if self.path else HERE),
+                                          filetypes=[("Excel workbooks", "*.xlsx")])
+        if name:
+            self.load(Path(name))
+
+    def refresh_list(self, select: int | None = None) -> None:
+        term = self.search_var.get().strip().lower()
+        self.tree.delete(*self.tree.get_children())
+        shown = 0
+        for index, row in enumerate(self.rows):
+            if term and term not in " ".join(row.values()).lower():
+                continue
+            shown += 1
+            self.tree.insert("", "end", iid=str(index), values=tuple(
+                row[field] for field in ("org_id", "org_name", "org_phone", "is_active", "last_checked")))
+        self.count_label.configure(text=f"{len(self.rows)} charities" + (f" ({shown} shown)" if term else ""))
+        if select is not None and self.tree.exists(str(select)):
+            self.tree.selection_set(str(select))
+            self.tree.see(str(select))
+
+    # Form ----------------------------------------------------------------------
+    def clear_form(self) -> None:
+        for var in self.vars.values():
+            var.set("")
+        self.description.delete("1.0", "end")
+        self.title_label.configure(text="Choose a charity on the left")
+        self.message.configure(text="")
+        self.save_button.state(["disabled"])
+        self.undo_button.state(["disabled"])
+
+    def show(self, row: dict[str, str]) -> None:
+        for field, var in self.vars.items():
+            var.set(row[field])
+        self.description.delete("1.0", "end")
+        self.description.insert("1.0", row["org_description"])
+        self.title_label.configure(text=f"Editing {row['org_id']} in the database")
+        in_list = any(r["org_id"] == row["org_id"] for r in self.app.charities_tab.records)
+        self.message.configure(text="" if in_list else
+                               "This charity is not in the charity list; edits go only to the spreadsheet.")
+        self.save_button.state(["!disabled"])
+        self.undo_button.state(["!disabled"])
+
+    def form_values(self) -> dict[str, str]:
+        values = {field: var.get().strip() for field, var in self.vars.items()}
+        values["org_description"] = " ".join(self.description.get("1.0", "end").split())
+        return values
+
+    def form_changes(self) -> dict[str, str]:
+        if self.selected is None:
+            return {}
+        original, values = self.rows[self.selected], self.form_values()
+        return {field: values[field] for field in DATABASE_FIELDS
+                if field not in READ_ONLY_DATABASE_FIELDS and values[field] != original[field]}
+
+    def on_select(self, _event: Any) -> None:
+        selection = self.tree.selection()
+        if not selection or int(selection[0]) == self.selected:
+            return
+        if self.form_changes() and not messagebox.askyesno(
+                "Unsaved edits", "Discard your unsaved edits to this charity?", parent=self):
+            self.refresh_list(select=self.selected)
+            return
+        self.selected = int(selection[0])
+        self.show(self.rows[self.selected])
+
+    def undo(self) -> None:
+        if self.selected is not None:
+            self.show(self.rows[self.selected])
+
+    def save(self) -> None:
+        changes = self.form_changes()
+        if not changes:
+            self.message.configure(text="Nothing has changed.")
+            return
+        row = self.rows[self.selected]
+        if "website_url" in changes:
+            changes["website_url"] = normalize_url(changes["website_url"])
+        if "state" in changes:
+            changes["state"] = changes["state"].upper()
+        charities = self.app.charities_tab
+        list_changes = {field: value for field, value in changes.items() if field in TARGET_FIELDS}
+        in_list = list_changes and any(r["org_id"] == row["org_id"] for r in charities.records)
+        if in_list:
+            current = next(r for r in charities.records if r["org_id"] == row["org_id"])
+            others = [r for r in charities.records if r["org_id"] != row["org_id"]]
+            errors, _ = validate_charity({**current, **list_changes}, others)
+            if errors:
+                messagebox.showerror("Please fix", "\n".join(errors), parent=self)
+                return
+            if charities.dirty and not messagebox.askyesno(
+                    "Unsaved charity list", "The Charities tab has unsaved changes. Saving this edit "
+                    "saves the charity list too, including those changes. Continue?", parent=self):
+                return
+        try:
+            write_database_changes(self.path, row["org_id"], changes)
+        except PermissionError:
+            messagebox.showerror("Spreadsheet is in use", "Could not save because the spreadsheet is open "
+                                 "or still syncing. Close it in Excel, wait for OneDrive, and try again.", parent=self)
+            return
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Could not save", str(exc), parent=self)
+            return
+        self.rows[self.selected] = {**row, **changes}
+        note = charities.apply_database_changes(row["org_id"], list_changes) if in_list else (
+            "Only the spreadsheet was changed." if list_changes else "")
+        self.refresh_list(select=self.selected)
+        self.show(self.rows[self.selected])
+        fields = ", ".join(DATABASE_LABELS[field] for field in changes)
+        self.message.configure(text=f"Saved {row['org_id']} ({fields}) to {self.path.name}. {note}".strip())
 
 
 # --- Run tab --------------------------------------------------------------
@@ -503,6 +828,7 @@ class RunTab(ttk.Frame):
         self.onedrive_var = tk.StringVar()
         self.local_output_var = tk.StringVar(value=str(HERE / "charity_contacts_live.json"))
         self.local_metadata_var = tk.StringVar(value=str(HERE / "Charity_Contacts_metadata.json"))
+        self.keep_backups = tk.StringVar(value="2")
         self.test_run = tk.BooleanVar(value=False)
         self.limit_var = tk.StringVar(value="3")
         self.workers_var = tk.StringVar(value="4")
@@ -530,7 +856,7 @@ class RunTab(ttk.Frame):
 
         group = ttk.LabelFrame(frame, text="Save results to", padding=8)
         group.pack(fill="x", pady=(8, 0))
-        ttk.Radiobutton(group, text="OneDrive backup (keeps newest 2, adds change report)",
+        ttk.Radiobutton(group, text="OneDrive backup (adds a change report; full runs update the live file)",
                         variable=self.save_mode, value="onedrive",
                         command=self.update_command).grid(row=0, column=0, columnspan=2, sticky="w")
         ttk.Label(group, text="OneDrive folder (blank = detect automatically):").grid(
@@ -538,14 +864,19 @@ class RunTab(ttk.Frame):
         self.path_row(group, self.onedrive_var, self.browse_onedrive, row=2, indent=20)
         self.onedrive_note = ttk.Label(group, text="", foreground="#777", wraplength=380)
         self.onedrive_note.grid(row=3, column=0, columnspan=2, sticky="w", padx=(20, 0))
+        keep = ttk.Frame(group)
+        keep.grid(row=4, column=0, columnspan=2, sticky="w", padx=(20, 0), pady=(4, 0))
+        ttk.Label(keep, text="Backups to keep:").pack(side="left")
+        ttk.Spinbox(keep, from_=1, to=50, width=4, textvariable=self.keep_backups).pack(side="left", padx=4)
+        ttk.Label(keep, text="(older ones are deleted)", foreground="#777").pack(side="left")
         ttk.Radiobutton(group, text="Local files (no backup or report; good for tests)",
                         variable=self.save_mode, value="local",
-                        command=self.update_command).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        ttk.Label(group, text="Main file:").grid(row=5, column=0, columnspan=2, sticky="w", padx=(20, 0))
-        self.path_row(group, self.local_output_var, lambda: self.browse_save(self.local_output_var), row=6, indent=20)
-        ttk.Label(group, text="Metadata file:").grid(row=7, column=0, columnspan=2, sticky="w", padx=(20, 0))
+                        command=self.update_command).grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(group, text="Main file:").grid(row=6, column=0, columnspan=2, sticky="w", padx=(20, 0))
+        self.path_row(group, self.local_output_var, lambda: self.browse_save(self.local_output_var), row=7, indent=20)
+        ttk.Label(group, text="Metadata file:").grid(row=8, column=0, columnspan=2, sticky="w", padx=(20, 0))
         self.path_row(group, self.local_metadata_var, lambda: self.browse_save(self.local_metadata_var),
-                      row=8, indent=20)
+                      row=9, indent=20)
 
         group = ttk.LabelFrame(frame, text="Speed", padding=8)
         group.pack(fill="x", pady=(8, 0))
@@ -583,7 +914,7 @@ class RunTab(ttk.Frame):
             row=row + 1, column=0, columnspan=2, sticky="w", pady=(4, 0))
         self.path_row(group, self.chrome_path, self.browse_chrome, row=row + 2)
 
-        for var in (self.target_var, self.onedrive_var, self.local_output_var, self.local_metadata_var,
+        for var in (self.target_var, self.onedrive_var, self.keep_backups, self.local_output_var, self.local_metadata_var,
                     self.limit_var, self.workers_var, self.chrome_path, *self.advanced.values()):
             var.trace_add("write", lambda *_: self.update_command())
 
@@ -665,8 +996,10 @@ class RunTab(ttk.Frame):
         if self.save_mode.get() == "local":
             args += ["--local-output", "--output", self.local_output_var.get().strip(),
                      "--metadata-output", self.local_metadata_var.get().strip()]
-        elif self.onedrive_var.get().strip():
-            args += ["--onedrive-folder", self.onedrive_var.get().strip()]
+        else:
+            if self.onedrive_var.get().strip():
+                args += ["--onedrive-folder", self.onedrive_var.get().strip()]
+            args += ["--keep-backups", self.keep_backups.get().strip()]
         if self.test_run.get():
             args += ["--limit", self.limit_var.get().strip()]
         args += ["--workers", self.workers_var.get().strip(), "--fetch-mode", self.fetch_mode.get()]
@@ -722,6 +1055,8 @@ class RunTab(ttk.Frame):
             flag: var.get() for flag, var in self.advanced.items()}}
         if self.test_run.get():
             numbers["Test run count"] = self.limit_var.get()
+        if self.save_mode.get() == "onedrive":
+            numbers["Backups to keep"] = self.keep_backups.get()
         for label, value in numbers.items():
             try:
                 if float(value) < 0:
@@ -873,13 +1208,16 @@ class CharityApp(tk.Tk):
         notebook.pack(fill="both", expand=True)
         self.run_tab = RunTab(notebook, self)
         self.charities_tab = CharitiesTab(notebook, self)
+        self.database_tab = DatabaseTab(notebook, self)
         notebook.add(self.charities_tab, text="Charities")
+        notebook.add(self.database_tab, text="Database")
         notebook.add(self.run_tab, text="Run")
         self.notebook = notebook
         self.update_title()
         path = targets or DEFAULT_TARGETS
         if path.exists():
             self.charities_tab.load(path)
+        self.database_tab.load(find_spreadsheet(HERE))
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def update_title(self) -> None:
@@ -890,6 +1228,9 @@ class CharityApp(tk.Tk):
     def on_close(self) -> None:
         if self.run_tab.process and not messagebox.askyesno(
                 "Scraper running", "The scraper is still running. Stop it and close?", parent=self):
+            return
+        if self.database_tab.form_changes() and not messagebox.askyesno(
+                "Unsaved database edits", "Discard your unsaved database edits?", parent=self):
             return
         if not self.charities_tab.confirm_discard_list():
             return

@@ -20,11 +20,10 @@ their shelter locations are confidential.
 - `compare_outputs.py`: compares two output files record by record.
 - `charity_scrape_targets.json`: the 58-site input list. Each entry has only
   `org_id`, `org_name`, `category`, `org_description`, `website_url`,
-  `is_active`, `org_phone`, `org_email`, `street_address`, `city`, `state`,
-  `zip`, and `last_checked`. To add an organization, add an entry with these
-  fields (at least `org_id`, `org_name`, and `website_url`).
-- `charity_contact_inventory.json`: the existing contact values from the
-  supplied table, converted to JSON. This is not a fresh web scrape.
+  `org_phone`, `org_email`, `street_address`, `city`, `state`, and `zip`
+  (`is_active` and `last_checked` are set by each scrape). To add an
+  organization, add an entry with these fields (at least `org_id`,
+  `org_name`, and `website_url`).
 
 ## Desktop app
 
@@ -36,7 +35,7 @@ python charity_gui.py
 ```
 
 Tkinter comes with the standard Windows and Mac Python installers; on Linux,
-install your distribution's `python3-tk` package. The window has two tabs:
+install your distribution's `python3-tk` package. The window has three tabs:
 
 - **Charities** edits `charity_scrape_targets.json` (or any list opened with
   "Open list..."). Pick a charity to edit it, or press "New charity". Only the
@@ -44,11 +43,28 @@ install your distribution's `python3-tk` package. The window has two tabs:
   category, and description are recommended, and every other field can be
   filled in when the client has it. A blank ID gets the next `CF-###` number.
   The form checks for a repeated website or ID and for badly formatted email,
-  phone, state, ZIP, and date values. "Add to list"/"Update charity" changes
+  phone, state, and ZIP values. "Add to list"/"Update charity" changes
   the list in the window; "Save list" writes the file.
+- **Database** shows the spreadsheet Power Automate builds from the live file.
+  It opens the newest `.xlsx` in this folder that has `org_id` and
+  `website_url` columns ("Choose spreadsheet..." picks another, "Reload" reads
+  it again). Pick a charity to see all its fields; every field except the ID,
+  active status, and last-checked date can be edited. "Save changes to
+  database" writes only the edited cells, re-reading the file first so
+  anything Power Automate wrote meanwhile is kept, and keeps the Excel table
+  as it is. If the spreadsheet is open in Excel or still syncing, it says so
+  and saves nothing. Edits to fields the charity list also has (name,
+  category, description, website, phone, email, address) are saved to
+  `charity_scrape_targets.json` too, so the next scrape keeps them: the
+  name, website, description, and category always come from the list, while
+  a phone, email, or address from the list is graded with everything found
+  on the website, so a website value seen on more pages can still replace it.
+  The app never copies scraped data into the spreadsheet; that only happens
+  through Power Automate. Needs `openpyxl` (in `requirements.txt`).
 - **Run** chooses the options and runs the scraper. It covers the charity list
   file, a test run of the first few charities (which switches to local files
-  so it does not use up a OneDrive backup), OneDrive backups or local files,
+  so it does not use up a OneDrive backup), OneDrive backups or local files
+  and how many backups to keep,
   the number of browsers (with a memory estimate for this computer), the
   faster fetch mode, and the advanced options under "Show advanced options".
   The command it will run is shown, the log and progress update live, Stop
@@ -94,7 +110,8 @@ the same order (see "Where the files are saved" for the location):
 - Phone, email, and address fields use the top-graded website value (see
   "How contacts are graded"); if nothing valid is found, the target file's
   value is kept.
-- `is_active` and `last_checked` come from the scrape itself (see below).
+- `is_active` and `last_checked` come from the scrape itself (see below);
+  `last_checked` is the date of the run, even when the site could not be read.
 
 For a small first test, add `--limit 3 --local-output` (see below for why
 `--local-output`). If a site behaves differently in headless Chrome, retry
@@ -112,10 +129,16 @@ By default each run is saved as a backup in OneDrive:
 - Each run creates `backup_<UTC date and time>` with both JSON files (named by
   `--output` and `--metadata-output`), a `change_report.txt` (see "Change
   report" below), and a `.charity_backup.json` marker.
-- Only the newest **2** backups are kept: after a run saves successfully, the
-  oldest backup folder is deleted. Only folders the scraper created (with the
-  marker and nothing else inside) are ever deleted; other files in the folder
-  are left alone.
+- After a **full** run (no `--limit`, not `--inventory-only`) saves
+  successfully, its `charity_contacts_live.json` is also copied to the
+  `Charity_Contacts` folder itself, replacing the previous copy; that is the
+  file the Power Automate flow imports. Test and inventory runs never replace
+  it, so Power Automate never imports a partial list.
+- Only the newest backups are kept, 2 by default (`--keep-backups N` to keep
+  more): after a run saves successfully, the oldest backup folders beyond
+  that number are deleted. Only folders the scraper created (with the marker
+  and nothing else inside) are ever deleted; other files in the folder are
+  left alone.
 - The files are first written to a local recovery folder
   (`%LOCALAPPDATA%\Charity_Contacts_Recovery`). If OneDrive cannot be written,
   they stay there, nothing old is deleted, and the run says where they are.
@@ -125,7 +148,8 @@ By default each run is saved as a backup in OneDrive:
 ### Change report
 
 Each backup has a `change_report.txt` comparing this run's main file with the
-previous backup's, matching charities by `org_id`. It lists only the charities
+most recent earlier backup's (however many backups are kept), matching
+charities by `org_id`. It lists only the charities
 that changed (in run order, with a blank line between them), then how many had
 no change:
 
@@ -151,7 +175,7 @@ Children's Place (CF-007)
 - The first run has nothing to compare with, and its report says so.
 - `--local-output` runs do not make backups, so they do not make a report.
 
-Every run counts toward the 2 backups, including test runs with `--limit` and
+Every run counts toward the kept backups, including test runs with `--limit` and
 `--inventory-only` runs, so a small test run can push out a full backup. Use
 `--local-output` for those: it saves to the `--output` and
 `--metadata-output` paths you give (metadata defaults to

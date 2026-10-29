@@ -11,3 +11,7 @@ venv/
 error_logs/
 profiles/
 cache/
+
+# Database spreadsheet from Power Automate (may hold client edits) and Excel lock files
+*.xlsx
+~$*

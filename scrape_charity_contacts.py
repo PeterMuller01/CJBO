@@ -303,10 +303,9 @@ def finalize(result, max_values=None):
             candidates.sort(key=lambda row: -row['priority'])
             del candidates[max_values:]
     if result['data_origin'] == 'live_scrape':
-        if result['extraction']['pages_checked']:
-            result['last_checked'] = result['scraped_at'][:10]
-            result['field_sources']['last_checked'] = dict(
-                value=result['last_checked'], source_url=None, method='website_check_date')
+        result['last_checked'] = result['scraped_at'][:10]
+        result['field_sources']['last_checked'] = dict(
+            value=result['last_checked'], source_url=None, method='website_check_date')
         # Active status follows whether this check could read the website; a
         # failed check is left for a person, since the site may just be down.
         status = result['extraction']['status']
@@ -382,8 +381,8 @@ def parse_markdown_table(path: Path) -> list[dict[str, str]]:
 
 # The scraper input (charity_scrape_targets.json) holds only these fields.
 TARGET_FIELDS = (
-    "org_id", "org_name", "category", "org_description", "website_url", "is_active",
-    "org_phone", "org_email", "street_address", "city", "state", "zip", "last_checked",
+    "org_id", "org_name", "category", "org_description", "website_url",
+    "org_phone", "org_email", "street_address", "city", "state", "zip",
 )
 
 
@@ -448,8 +447,8 @@ def new_result(item: dict[str, Any], data_origin: str) -> dict[str, Any]:
         "city": item["city"],
         "state": item["state"],
         "zip": item["zip"],
-        "is_active": item["is_active"],
-        "last_checked": item["last_checked"],
+        "is_active": item.get("is_active", ""),
+        "last_checked": item.get("last_checked", ""),
         "scraped_at": utc_now() if data_origin == "live_scrape" else None,
         "data_origin": data_origin,
         "contacts": {
@@ -1864,8 +1863,26 @@ def build_change_report(organizations: list[dict[str, Any]], previous: tuple[Pat
     return "\n".join(lines) + "\n"
 
 
+def save_latest_live_file(folder: Path, source: Path) -> Path:
+    """Publish one complete live JSON, keeping the old copy until replacement."""
+    destination_folder = folder
+    retry_backup_io(lambda: destination_folder.mkdir(parents=True, exist_ok=True))
+    destination = destination_folder / source.name
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".live_", suffix=".tmp", dir=destination_folder)
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        retry_backup_io(lambda: shutil.copyfile(source, temporary))
+        retry_backup_io(lambda: os.replace(temporary, destination))
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination
+
+
 def save_backup_pair(folder: Path, records: list[dict[str, Any]],
-                     organization_name: str, metadata_name: str) -> tuple[Path, Path]:
+                     organization_name: str, metadata_name: str,
+                     *, update_live: bool = True, keep: int = 2) -> tuple[Path, Path]:
     """Save in the final folder and mark complete only after both files close.
 
     Never rename a folder inside OneDrive. First retain a local recovery copy
@@ -1909,15 +1926,22 @@ def save_backup_pair(folder: Path, records: list[dict[str, Any]],
         return staging / organization_name, staging / metadata_name
     shutil.rmtree(staging, ignore_errors=True)
     print(f"Wrote change report to {backup / CHANGE_REPORT_NAME}")
+    if update_live:
+        try:
+            live_path = save_latest_live_file(folder, backup / organization_name)
+            print(f"Updated latest live file: {live_path}")
+        except OSError as exc:
+            print(f"The backup was saved to {backup}, but the latest live file could not "
+                  f"be fully updated: {exc}. Close open files or let OneDrive finish syncing.")
     try:
-        cleanup_old_backups(folder)
+        cleanup_old_backups(folder, keep)
     except OSError as exc:
         # Retention trouble must not turn a completed save into a failed scrape.
         print(f"Both JSON files were saved to {backup}, but backup cleanup failed: {exc}")
     return backup / organization_name, backup / metadata_name
 
 
-def request_admin_cleanup(folder: Path) -> bool:
+def request_admin_cleanup(folder: Path, keep: int) -> bool:
     """Request Windows UAC elevation for cleanup only, never for Chrome."""
     if sys.platform != "win32":
         return False
@@ -1927,7 +1951,7 @@ def request_admin_cleanup(folder: Path) -> bool:
 
     script_path = Path(__file__).resolve()
     arguments = subprocess.list2cmdline([
-        str(script_path), "--cleanup-backups-only", str(folder.resolve()),
+        str(script_path), "--cleanup-backups-only", str(folder.resolve()), "--keep-backups", str(keep),
     ])
     # Encode a PowerShell program with literal paths; shell=False prevents
     # cmd.exe expansion. Start-Process receives a single quoted argument list.
@@ -1991,13 +2015,13 @@ def managed_backups(folder: Path) -> list[tuple[Path, list[str]]]:
     return sorted(managed, key=lambda pair: pair[0].name)
 
 
-def cleanup_old_backups(folder: Path, allow_elevation: bool = True) -> bool:
-    """Recheck ownership and keep the newest two, optionally elevating on denial."""
+def cleanup_old_backups(folder: Path, keep: int = 2, allow_elevation: bool = True) -> bool:
+    """Recheck ownership and keep the newest ``keep``, optionally elevating on denial."""
     marker = ".charity_backup.json"
     managed = [path for path, _ in managed_backups(folder)]
     failed = False
     needs_admin = False
-    for old in sorted(managed, key=lambda path: path.name)[:-2]:
+    for old in sorted(managed, key=lambda path: path.name)[:-keep]:
         try:
             marker_text = (old / marker).read_text(encoding="utf-8")
             remove_backup(old, json.loads(marker_text)["files"], marker_text)
@@ -2009,10 +2033,10 @@ def cleanup_old_backups(folder: Path, allow_elevation: bool = True) -> bool:
     if needs_admin and allow_elevation and sys.platform == "win32":
         # One prompt for the whole run. The elevated child re-scans backups
         # and cannot start scraping or recursively request elevation.
-        return request_admin_cleanup(folder)
+        return request_admin_cleanup(folder, keep)
     if failed:
         print("New JSON files remain saved. Close files open in the backup folder, "
-              "let OneDrive finish syncing, then rerun. More than two backups may "
+              f"let OneDrive finish syncing, then rerun. More than {keep} backups may "
               "remain until Windows allows deletion.")
     return not failed
 
@@ -2112,8 +2136,14 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Process only the first N organizations (useful for a small test run).",
     )
+    parser.add_argument(
+        "--keep-backups", type=int, default=2,
+        help="OneDrive backup folders to keep; older ones are deleted after a successful save (default: 2).",
+    )
     parser.add_argument("--cleanup-backups-only", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.keep_backups < 1:
+        parser.error("--keep-backups must be at least 1.")
     if args.cleanup_backups_only is not None:
         return args
     if args.delay_seconds < 0:
@@ -2152,7 +2182,8 @@ def main() -> None:
     if args.cleanup_backups_only is not None:
         # Separate cleanup process: no target loading, scraping, or new backups.
         try:
-            success = cleanup_old_backups(Path(args.cleanup_backups_only), allow_elevation=False)
+            success = cleanup_old_backups(Path(args.cleanup_backups_only), args.keep_backups,
+                                          allow_elevation=False)
         except OSError as exc:
             print(f"Backup cleanup failed: {exc}")
             success = False
@@ -2195,6 +2226,10 @@ def main() -> None:
         output_path, metadata_path = save_backup_pair(
             args.backup_folder, records, output_path.name,
             Path(args.metadata_output or "Charity_Contacts_metadata.json").name,
+            # Only a run over the whole list replaces the file Power Automate
+            # imports; test runs (--limit) and inventory runs do not.
+            update_live=not args.inventory_only and args.limit is None,
+            keep=args.keep_backups,
         )
         print(f"Wrote {len(records)} contact/metadata records to {metadata_path}")
     else:
